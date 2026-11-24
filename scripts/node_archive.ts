@@ -1,14 +1,17 @@
 import process from "node:process";
 import { ProcessCommand } from "#proc";
 import * as nodeFs from "#fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { VERSION } from "../src/version.ts";
 import {
   checksumText,
+  assertNodePackageContents,
   loadLicenseInventory,
+  packagedSkillFiles,
   renderThirdPartyNotices,
   sha256File,
+  validateNodeArchiveEntries,
 } from "./release_package.ts";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -23,6 +26,7 @@ const files = [
   "licenses/Apache-2.0.txt",
   "licenses/MCP-SDK-MIT.txt",
   "licenses/Zod-MIT.txt",
+  ...packagedSkillFiles,
 ];
 
 async function create(): Promise<void> {
@@ -41,6 +45,18 @@ async function create(): Promise<void> {
       inventory.dependencies.flatMap((item) => item.licenseFiles),
     )) {
       await nodeFs.copyFile(join(root, relative), join(stage, relative));
+    }
+    for (const relative of packagedSkillFiles) {
+      const source = join(root, ".agents", relative);
+      const destination = join(stage, relative);
+      const info = await nodeFs.lstat(source);
+      if (!info.isFile() || info.isSymbolicLink()) {
+        throw new Error(
+          `Node release skill source must be a regular file: ${source}`,
+        );
+      }
+      await nodeFs.mkdir(dirname(destination), { recursive: true });
+      await nodeFs.copyFile(source, destination);
     }
     const manifest = {
       product: "acp-mcp",
@@ -64,6 +80,21 @@ async function create(): Promise<void> {
     }).spawn().status;
     if (!zip.success)
       throw new Error("Could not create Node release ZIP (zip command failed)");
+    await validateNodeArchiveEntries(archive);
+    const extracted = await nodeFs.makeTempDir({
+      prefix: "acp-mcp-node-package-check-",
+    });
+    try {
+      const unzip = await new ProcessCommand("unzip", {
+        args: ["-q", archive, "-d", extracted],
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      if (!unzip.success) throw new Error("Could not verify Node release ZIP");
+      await assertNodePackageContents(extracted, root);
+    } finally {
+      await nodeFs.removePath(extracted, { recursive: true });
+    }
     const archiveSha256 = await sha256File(archive);
     await nodeFs.writeText(
       join(output, checksumName),
@@ -83,6 +114,55 @@ async function stage(): Promise<void> {
   const source = join(root, "dist", "node-package");
   const destination = join(root, "dist", "github-release-assets");
   const names = [name, checksumName, manifestName];
+  const archivePath = join(source, name);
+  await validateNodeArchiveEntries(archivePath);
+  const extracted = await nodeFs.makeTempDir({
+    prefix: "acp-mcp-node-stage-check-",
+  });
+  let embeddedEntryHash: string | undefined;
+  try {
+    const unzip = await new ProcessCommand("unzip", {
+      args: ["-q", join(source, name), "-d", extracted],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    if (!unzip.success) throw new Error("Could not verify staged Node ZIP");
+    await assertNodePackageContents(extracted, root);
+    const embedded = JSON.parse(
+      await nodeFs.readText(join(extracted, "node-manifest.json")),
+    ) as Record<string, unknown>;
+    embeddedEntryHash = await sha256File(join(extracted, "acp-mcp.mjs"));
+    if (
+      embedded.product !== "acp-mcp" ||
+      embedded.version !== VERSION ||
+      embedded.runtime !== "node >=24.12.0" ||
+      embedded.entry !== "acp-mcp.mjs" ||
+      embedded.entrySha256 !== embeddedEntryHash ||
+      Object.keys(embedded).length !== 5
+    ) {
+      throw new Error("Staged Node entry does not match its manifest");
+    }
+  } finally {
+    await nodeFs.removePath(extracted, { recursive: true });
+  }
+  const archiveHash = await sha256File(archivePath);
+  const outer = JSON.parse(
+    await nodeFs.readText(join(source, manifestName)),
+  ) as Record<string, unknown>;
+  if (
+    outer.product !== "acp-mcp" ||
+    outer.version !== VERSION ||
+    outer.runtime !== "node >=24.12.0" ||
+    outer.entry !== "acp-mcp.mjs" ||
+    outer.archive !== name ||
+    outer.archiveSha256 !== archiveHash ||
+    outer.entrySha256 !== embeddedEntryHash ||
+    (await nodeFs.readText(join(source, checksumName))) !==
+      checksumText(archiveHash, name) ||
+    Object.keys(outer).length !== 7
+  ) {
+    throw new Error("Node release checksum or manifest does not match");
+  }
   await nodeFs.mkdir(destination, { recursive: true });
   for (const filename of names)
     await nodeFs.copyFile(join(source, filename), join(destination, filename));

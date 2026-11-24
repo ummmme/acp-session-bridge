@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { VERSION } from "../src/version.ts";
 import {
   checksumText,
+  assertPackagedSkillFilesMatch,
   extractReleaseArchive,
   findNodeRuntimeLicensePath,
   loadLicenseInventory,
@@ -86,6 +87,7 @@ export async function stageReleaseAssets(
   const extracted = await nodeFs.makeTempDir({ prefix: "acp-mcp-gh-stage-" });
   try {
     await extractReleaseArchive(archive, manifest.target, extracted);
+    await assertPackagedSkillFilesMatch(extracted, projectRoot);
     const embedded = validatePackageManifest(
       JSON.parse(await nodeFs.readText(join(extracted, "manifest.json"))),
     );

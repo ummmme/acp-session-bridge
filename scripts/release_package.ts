@@ -169,10 +169,153 @@ export async function packageContents(
     await nodeFs.mkdir(join(packageRoot, "licenses"), { recursive: true });
     await nodeFs.copyFile(join(root, relative), destination);
   }
+  for (const relative of packagedSkillFiles) {
+    const source = join(root, ".agents", relative);
+    const destination = join(packageRoot, relative);
+    await nodeFs.mkdir(dirname(destination), { recursive: true });
+    const info = await nodeFs.lstat(source);
+    if (!info.isFile() || info.isSymbolicLink()) {
+      throw new Error(`Release skill source must be a regular file: ${source}`);
+    }
+    await nodeFs.copyFile(source, destination);
+  }
   await nodeFs.writeText(
     join(packageRoot, "manifest.json"),
     `${JSON.stringify(manifest, null, 2)}\n`,
   );
+}
+
+export async function validateNodeArchiveEntries(
+  archivePath: string,
+): Promise<void> {
+  const result = await new ProcessCommand("unzip", {
+    args: ["-Z1", archivePath],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  if (!result.success) throw new Error("Could not list Node release ZIP");
+  const entries = new TextDecoder()
+    .decode(result.stdout)
+    .trim()
+    .split(/\r?\n/)
+    .map((entry) => entry.replace(/^\.\//, ""));
+  const files = new Set([
+    "acp-mcp.mjs",
+    "node-manifest.json",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.txt",
+    "licenses/Apache-2.0.txt",
+    "licenses/MCP-SDK-MIT.txt",
+    "licenses/Zod-MIT.txt",
+    ...packagedSkillFiles,
+  ]);
+  const directories = new Set([
+    "licenses/",
+    "skills/",
+    "skills/acp-mcp/",
+    "skills/gemini/",
+  ]);
+  const actualFiles = entries.filter((entry) => !entry.endsWith("/"));
+  const actualDirectories = entries.filter((entry) => entry.endsWith("/"));
+  if (
+    actualFiles.length !== files.size ||
+    actualFiles.some((entry) => !files.has(entry)) ||
+    [...files].some((entry) => !actualFiles.includes(entry)) ||
+    actualDirectories.length !== new Set(actualDirectories).size ||
+    actualDirectories.some((entry) => !directories.has(entry)) ||
+    entries.some(
+      (entry) =>
+        entry.startsWith("/") ||
+        entry.startsWith("\\") ||
+        entry.includes("\\") ||
+        entry.split("/").includes(".."),
+    )
+  ) {
+    throw new Error("Node release ZIP contains missing or unexpected paths");
+  }
+}
+
+export async function assertNodePackageContents(
+  packageRoot: string,
+  root = projectRoot,
+): Promise<void> {
+  const expected = new Set([
+    "acp-mcp.mjs",
+    "node-manifest.json",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.txt",
+    "licenses/Apache-2.0.txt",
+    "licenses/MCP-SDK-MIT.txt",
+    "licenses/Zod-MIT.txt",
+    "licenses",
+    "skills",
+    "skills/acp-mcp",
+    "skills/gemini",
+    ...packagedSkillFiles,
+  ]);
+  const actual = new Set<string>();
+  const visit = async (path: string, relative: string): Promise<void> => {
+    for await (const entry of nodeFs.readDir(path)) {
+      const item = relative ? `${relative}/${entry.name}` : entry.name;
+      const fullPath = join(path, entry.name);
+      const info = await nodeFs.lstat(fullPath);
+      if (info.isSymbolicLink()) {
+        throw new Error("Node release package contains a symbolic link");
+      }
+      if (info.isDirectory()) {
+        actual.add(item);
+        await visit(fullPath, item);
+      } else if (info.isFile()) actual.add(item);
+      else throw new Error("Node release package contains a special file");
+    }
+  };
+  await visit(packageRoot, "");
+  if (
+    [...actual].some((entry) => !expected.has(entry)) ||
+    [...expected].some((entry) => !actual.has(entry))
+  ) {
+    throw new Error(
+      "Node release package contains missing or unexpected paths",
+    );
+  }
+  const inventory = await loadLicenseInventory(root);
+  const expectedBytes = new Map<string, Uint8Array>([
+    ["LICENSE", await nodeFs.readFile(join(root, "LICENSE"))],
+    [
+      "THIRD_PARTY_NOTICES.txt",
+      new TextEncoder().encode(renderThirdPartyNotices(inventory)),
+    ],
+  ]);
+  for (const relative of [
+    "licenses/Apache-2.0.txt",
+    "licenses/MCP-SDK-MIT.txt",
+    "licenses/Zod-MIT.txt",
+  ]) {
+    expectedBytes.set(relative, await nodeFs.readFile(join(root, relative)));
+  }
+  for (const [relative, bytes] of expectedBytes) {
+    if (
+      !Buffer.from(await nodeFs.readFile(join(packageRoot, relative))).equals(
+        Buffer.from(bytes),
+      )
+    ) {
+      throw new Error(`Node release package content mismatch: ${relative}`);
+    }
+  }
+  await assertPackagedSkillFilesMatch(packageRoot, root);
+}
+
+export async function assertPackagedSkillFilesMatch(
+  packageRoot: string,
+  root = projectRoot,
+): Promise<void> {
+  for (const relative of packagedSkillFiles) {
+    const packaged = await nodeFs.readFile(join(packageRoot, relative));
+    const source = await nodeFs.readFile(join(root, ".agents", relative));
+    if (!Buffer.from(packaged).equals(Buffer.from(source))) {
+      throw new Error(`Release archive skill text mismatch: ${relative}`);
+    }
+  }
 }
 
 export async function findNodeRuntimeLicensePath(): Promise<string> {
@@ -211,6 +354,11 @@ async function runTar(args: string[], cwd: string): Promise<string> {
   return new TextDecoder().decode(result.stdout);
 }
 
+export const packagedSkillFiles = [
+  "skills/acp-mcp/SKILL.md",
+  "skills/gemini/SKILL.md",
+] as const;
+
 const packagedFiles = [
   "LICENSE",
   "THIRD_PARTY_NOTICES.txt",
@@ -218,12 +366,20 @@ const packagedFiles = [
   "licenses/MCP-SDK-MIT.txt",
   "licenses/Zod-MIT.txt",
   "licenses/Node.js-LICENSE.txt",
+  ...packagedSkillFiles,
   "manifest.json",
 ] as const;
 
 function expectedArchiveEntries(executable: string): Set<string> {
   return new Set([executable, ...packagedFiles]);
 }
+
+const expectedArchiveDirectories = new Set([
+  "licenses/",
+  "skills/",
+  "skills/acp-mcp/",
+  "skills/gemini/",
+]);
 
 export async function validateArchiveEntries(
   archivePath: string,
@@ -245,7 +401,7 @@ export async function validateArchiveEntries(
     files.length !== actual.size ||
     [...actual].some((entry) => !expected.has(entry)) ||
     [...expected].some((entry) => !actual.has(entry)) ||
-    directories.some((entry) => entry !== "licenses/")
+    directories.some((entry) => !expectedArchiveDirectories.has(entry))
   ) {
     throw new Error(
       `Release archive contains missing or unexpected paths; actual: ${[
@@ -295,7 +451,7 @@ export async function extractReleaseArchive(
   const names = releaseNames("0.0.0", target);
   const expected = new Set([
     ...expectedArchiveEntries(names.executable),
-    "licenses",
+    ...[...expectedArchiveDirectories].map((entry) => entry.slice(0, -1)),
   ]);
   const actual = new Set<string>();
   const visit = async (path: string, relative: string) => {
@@ -406,11 +562,16 @@ export async function createReleaseArchive(
       inventory.dependencies.flatMap((item) => item.licenseFiles),
     )) {
       if (
-        (await nodeFs.readText(join(extracted, relative))) !==
-        (await nodeFs.readText(join(input.root ?? projectRoot, relative)))
-      )
+        !Buffer.from(await nodeFs.readFile(join(extracted, relative))).equals(
+          Buffer.from(
+            await nodeFs.readFile(join(input.root ?? projectRoot, relative)),
+          ),
+        )
+      ) {
         throw new Error(`Release archive license text mismatch: ${relative}`);
+      }
     }
+    await assertPackagedSkillFilesMatch(extracted, input.root ?? projectRoot);
     const archiveHash = await sha256File(archivePath);
     return {
       ...packageManifest,

@@ -336,7 +336,7 @@ test("cancelling after completed prompt preserves completion", async () => {
 });
 
 test("closed sessions release capacity while active sessions are retained", async () => {
-  if (DEFAULT_MAX_MANAGED_SESSIONS !== 8) {
+  if (DEFAULT_MAX_MANAGED_SESSIONS !== 20) {
     throw new Error(
       `Production session capacity changed: ${DEFAULT_MAX_MANAGED_SESSIONS}`,
     );
@@ -354,8 +354,24 @@ test("closed sessions release capacity while active sessions are retained", asyn
   );
   const sessionCount = () => manager.sessionCount;
   try {
-    const first = await manager.start("fake", process.cwd());
-    const second = await manager.start("fake", process.cwd());
+    const results = await Promise.allSettled(
+      Array.from({ length: 3 }, () => manager.start("fake", process.cwd())),
+    );
+    const opened = results.flatMap((r) =>
+      r.status === "fulfilled" ? [r.value] : [],
+    );
+    const rejectedStart = results.find((r) => r.status === "rejected");
+    if (
+      opened.length !== 2 ||
+      !String(rejectedStart?.reason).includes(
+        "Active session limit (2) reached",
+      )
+    ) {
+      throw new Error(
+        "Concurrent starts did not enforce the two-slot test limit",
+      );
+    }
+    const [first, second] = opened;
     if (sessionCount() !== 2) {
       throw new Error("The test session capacity was not filled");
     }

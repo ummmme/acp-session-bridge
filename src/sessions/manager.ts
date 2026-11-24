@@ -1,4 +1,5 @@
 import process from "node:process";
+import { realpath } from "#fs";
 import {
   canonicalAgentId,
   type AgentDefinition,
@@ -24,6 +25,7 @@ interface ManagedSession {
   agentDefinition: AgentDefinition;
   cwd: string;
   acpSessionId: string;
+  acpSessionKey: string;
   acpProtocol: AcpProtocol;
   driver: ProtocolDriver;
   process: Awaited<ReturnType<typeof startAgent>>;
@@ -154,7 +156,7 @@ function configOptionsFromUpdate(
 export const DEFAULT_SESSION_START_TIMEOUT_MS = 30_000;
 export const DEFAULT_SESSION_CLOSE_TIMEOUT_MS = 5_000;
 export const DEFAULT_ASYNC_CONFIG_OPTION_TIMEOUT_MS = 5_000;
-export const DEFAULT_MAX_MANAGED_SESSIONS = 8;
+export const DEFAULT_MAX_MANAGED_SESSIONS = 20;
 
 interface PendingPermission {
   id: string;
@@ -171,6 +173,10 @@ interface PendingPermission {
 
 export class SessionManager {
   private readonly sessions = new Map<string, ManagedSession>();
+  private readonly acpSessionOwners = new Map<
+    string,
+    ManagedSession | symbol
+  >();
   private readonly configOptionWaiters = new Map<
     string,
     Set<ConfigOptionWaiter>
@@ -179,6 +185,7 @@ export class SessionManager {
   private readonly startupTimeoutMs: number;
   private readonly closeRequestTimeoutMs: number;
   private readonly maxSessions: number;
+  private occupiedSlots = 0;
 
   constructor(
     agents: AgentMap,
@@ -304,6 +311,14 @@ export class SessionManager {
     };
   }
 
+  private acpSessionKey(
+    agentId: string,
+    cwd: string,
+    acpSessionId: string,
+  ): string {
+    return JSON.stringify([agentId, cwd, acpSessionId]);
+  }
+
   private requireSession(id: string): ManagedSession {
     const session = this.sessions.get(id);
     if (!session) throw new Error(`Unknown session: ${id}`);
@@ -376,9 +391,59 @@ export class SessionManager {
     loadSessionId?: string,
     options: SessionLaunchOptions = {},
   ): Promise<ManagedSession> {
-    if (this.sessions.size >= this.maxSessions) {
+    if (this.occupiedSlots >= this.maxSessions) {
       throw new Error(`Active session limit (${this.maxSessions}) reached`);
     }
+    this.occupiedSlots++;
+    const launchOwner = Symbol("ACP session launch");
+    let loadKey: string | undefined;
+    try {
+      const canonicalCwd = await realpath(cwd);
+      const canonicalId = canonicalAgentId(agentId);
+      if (loadSessionId) {
+        loadKey = this.acpSessionKey(canonicalId, canonicalCwd, loadSessionId);
+        const owner = this.acpSessionOwners.get(loadKey);
+        if (owner !== undefined) {
+          if (typeof owner !== "symbol" && !this.sessions.has(owner.id)) {
+            throw new Error(
+              `ACP session is closing: ${loadSessionId}; retry shortly`,
+            );
+          }
+          throw new Error(`ACP session ID already managed: ${loadSessionId}`);
+        }
+        this.acpSessionOwners.set(loadKey, launchOwner);
+      }
+      return await this.launchReserved(
+        agentId,
+        canonicalCwd,
+        config,
+        modeId,
+        permissionPolicy,
+        loadSessionId,
+        options,
+        launchOwner,
+        loadKey,
+      );
+    } catch (error) {
+      this.occupiedSlots--;
+      if (loadKey && this.acpSessionOwners.get(loadKey) === launchOwner) {
+        this.acpSessionOwners.delete(loadKey);
+      }
+      throw error;
+    }
+  }
+
+  private async launchReserved(
+    agentId: string,
+    cwd: string,
+    config: Record<string, string>,
+    modeId: string | undefined,
+    permissionPolicy: PermissionPolicy,
+    loadSessionId: string | undefined,
+    options: SessionLaunchOptions,
+    launchOwner: symbol,
+    loadKey: string | undefined,
+  ): Promise<ManagedSession> {
     const canonicalId = canonicalAgentId(agentId);
     const def =
       options.agentDefinition ??
@@ -397,28 +462,65 @@ export class SessionManager {
     };
     const process = await startAgent(launchDefinition, cwd);
     const earlyUpdates: NormalizedAcpUpdate[] = [];
+    let reservedAcpKey = loadKey;
+    let managedSession: ManagedSession | undefined;
+    let launchFailed = false;
+    const reserveAcpId = (acpSessionId: string) => {
+      const key = this.acpSessionKey(canonicalId, cwd, acpSessionId);
+      if (this.acpSessionOwners.has(key)) {
+        throw new Error(`ACP session ID already managed: ${acpSessionId}`);
+      }
+      reservedAcpKey = key;
+      this.acpSessionOwners.set(key, launchOwner);
+      return key;
+    };
     let wakeStartupUpdate: (() => void) | undefined;
     const driver = createProtocolDriver(protocol, def, process, {
       update: (update) => {
-        const managed = [...this.sessions.values()].find(
-          (item) => item.acpSessionId === update.sessionId,
-        );
-        if (!managed) {
-          earlyUpdates.push(update);
-          wakeStartupUpdate?.();
-        } else this.receiveUpdate(managed, update);
+        if (managedSession) {
+          if (
+            managedSession.acpSessionId === update.sessionId &&
+            this.sessions.get(managedSession.id) === managedSession
+          ) {
+            this.receiveUpdate(managedSession, update);
+          }
+          return;
+        }
+        earlyUpdates.push(update);
+        wakeStartupUpdate?.();
       },
-      permission: (request) =>
-        this.requestPermission(request, permissionPolicy),
+      permission: (request) => {
+        if (
+          !managedSession ||
+          managedSession.acpSessionId !== request.sessionId
+        ) {
+          return Promise.resolve({
+            outcome: { outcome: "cancelled" as const },
+          });
+        }
+        return this.requestPermission(managedSession, request);
+      },
     });
     let startupTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       const startup = async () => {
         const initialized = await driver.initialize();
+        if (launchFailed) {
+          throw new Error("ACP session startup already failed");
+        }
         const sessionResponse = loadSessionId
           ? await driver.resumeSession(loadSessionId, cwd)
           : await driver.newSession(cwd);
         const acpId = sessionResponse.sessionId;
+        if (launchFailed) {
+          throw new Error("ACP session startup already failed");
+        }
+        const acpKey = this.acpSessionKey(canonicalId, cwd, acpId);
+        if (reservedAcpKey === undefined) {
+          reserveAcpId(acpId);
+        } else if (reservedAcpKey !== acpKey) {
+          throw new Error(`ACP resumed session ID mismatch: ${acpId}`);
+        }
         let configOptions = [...sessionResponse.configOptions];
         let configOptionsEarlyUpdateCursor = 0;
         let appliedEarlyUpdates = 0;
@@ -529,12 +631,20 @@ export class SessionManager {
         configOptionsEarlyUpdateCursor,
       } = await Promise.race([startup(), timedOut]);
       const acpId = sessionResponse.sessionId;
+      const acpKey = this.acpSessionKey(canonicalId, cwd, acpId);
+      if (
+        reservedAcpKey !== acpKey ||
+        this.acpSessionOwners.get(acpKey) !== launchOwner
+      ) {
+        throw new Error(`ACP session ownership was lost: ${acpId}`);
+      }
       const session: ManagedSession = {
         id: crypto.randomUUID(),
         agentId: canonicalId,
         agentDefinition: def,
         cwd,
         acpSessionId: acpId,
+        acpSessionKey: acpKey,
         acpProtocol: driver.protocol,
         driver,
         process,
@@ -549,6 +659,8 @@ export class SessionManager {
         permissionPolicy,
         pendingPermissions: new Map(),
       };
+      this.acpSessionOwners.set(acpKey, session);
+      managedSession = session;
       this.sessions.set(session.id, session);
       for (const [index, update] of earlyUpdates.entries()) {
         if (update.sessionId === acpId) {
@@ -561,8 +673,18 @@ export class SessionManager {
       }
       return session;
     } catch (error) {
+      launchFailed = true;
       driver.closeConnection(error);
-      await stopAgent(process.child, 1000);
+      try {
+        await stopAgent(process.child, 1000);
+      } finally {
+        if (
+          reservedAcpKey !== undefined &&
+          this.acpSessionOwners.get(reservedAcpKey) === launchOwner
+        ) {
+          this.acpSessionOwners.delete(reservedAcpKey);
+        }
+      }
       throw new Error(
         `Could not start ${agentId}: ${
           error instanceof Error ? error.message : String(error)
@@ -681,10 +803,17 @@ export class SessionManager {
   ): Promise<PromptHandle> {
     const prompt = this.requirePrompt(sessionId, promptId);
     if (prompt.state === "running") {
-      await Promise.race([
-        prompt.done,
-        new Promise((resolve) => setTimeout(resolve, Math.max(0, waitMs))),
-      ]);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          prompt.done,
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, Math.max(0, waitMs));
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
     }
     return this.promptHandle(prompt);
   }
@@ -919,16 +1048,19 @@ export class SessionManager {
   }
 
   private async requestPermission(
+    session: ManagedSession,
     params: AcpPermissionRequest,
-    policy: PermissionPolicy,
   ) {
-    const session = [...this.sessions.values()].find(
-      (item) => item.acpSessionId === params.sessionId,
-    );
     const options = params.options ?? [];
     const choose = (kind: string) =>
       options.find((option) => option.kind === kind);
-    if (!session) return { outcome: { outcome: "cancelled" as const } };
+    if (
+      session.acpSessionId !== params.sessionId ||
+      this.sessions.get(session.id) !== session
+    ) {
+      return { outcome: { outcome: "cancelled" as const } };
+    }
+    const policy = session.permissionPolicy;
     this.recordPromptActivity(session);
     const requestId = crypto.randomUUID();
     const raw = {
@@ -1015,6 +1147,19 @@ export class SessionManager {
     return { permissionId, optionId, resolved: true };
   }
 
+  async closeIfIdle(id: string): Promise<boolean> {
+    const session = this.requireSession(id);
+    if (
+      session.promptActive ||
+      session.prompt?.state === "running" ||
+      session.pendingPermissions.size > 0
+    )
+      return false;
+    // An idle session is removed by close() before its first await.
+    await this.close(id);
+    return true;
+  }
+
   async close(id: string): Promise<void> {
     const session = this.requireSession(id);
     if (session.prompt?.state === "running") {
@@ -1029,19 +1174,26 @@ export class SessionManager {
       waiter.finish(session.configOptions);
     this.cancelPendingPermissions(session);
     this.sessions.delete(id);
-    let closeTimer: ReturnType<typeof setTimeout> | undefined;
-    const closeRequest = session.driver
-      .closeSession(session.acpSessionId)
-      .catch(() => undefined);
-    await Promise.race([
-      closeRequest,
-      new Promise<void>((resolve) => {
-        closeTimer = setTimeout(resolve, this.closeRequestTimeoutMs);
-      }),
-    ]);
-    if (closeTimer !== undefined) clearTimeout(closeTimer);
-    session.driver.closeConnection();
-    await stopAgent(session.process.child, 5000);
+    try {
+      let closeTimer: ReturnType<typeof setTimeout> | undefined;
+      const closeRequest = session.driver
+        .closeSession(session.acpSessionId)
+        .catch(() => undefined);
+      await Promise.race([
+        closeRequest,
+        new Promise<void>((resolve) => {
+          closeTimer = setTimeout(resolve, this.closeRequestTimeoutMs);
+        }),
+      ]);
+      if (closeTimer !== undefined) clearTimeout(closeTimer);
+      session.driver.closeConnection();
+      await stopAgent(session.process.child, 5000);
+    } finally {
+      if (this.acpSessionOwners.get(session.acpSessionKey) === session) {
+        this.acpSessionOwners.delete(session.acpSessionKey);
+        this.occupiedSlots--;
+      }
+    }
   }
 
   async closeAll(): Promise<void> {

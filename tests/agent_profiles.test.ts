@@ -168,11 +168,13 @@ test("agy Antigravity profile preserves overrides and validates AGY_BIN paths wi
     process.platform === "win32" ? ".exe" : ""
   }`;
   try {
-    await nodeFs.copyFile(process.execPath, executable);
-    await nodeFs.copyFile(process.execPath, adapter);
-    if (process.platform !== "win32") {
-      await nodeFs.chmod(executable, 0o755);
-      await nodeFs.chmod(adapter, 0o755);
+    if (process.platform === "win32") {
+      await nodeFs.copyFile(process.execPath, executable);
+      await nodeFs.copyFile(process.execPath, adapter);
+    } else {
+      // Some Node distributions resolve shared libraries relative to the binary.
+      await nodeFs.symlink(process.execPath, executable);
+      await nodeFs.symlink(process.execPath, adapter);
     }
     await nodeFs.writeText(
       configPath,

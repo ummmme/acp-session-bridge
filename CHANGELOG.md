@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- Ship the `acp-mcp` and `gemini` Skills alongside the MCP server in the Node archive and each native package. The Claude Code Skill supports project-scoped follow-ups and explicit session selection.
+- Support 20 managed sessions per server by default. Prevent duplicate resumes for the same agent, real workspace, and downstream session ID, including concurrent requests. Route replies and approvals to the originating connection.
+- Add `includePromptText: false` to intermediate polls and `close_session(ifIdle: true)` for cleanup without interrupting a prompt or pending approval. Existing callers retain the previous behavior when the flags are omitted.
+- Return sanitized failure diagnostics for managed prompts, including failures reported after an asynchronous submission.
+
 ## 0.2.6 (released)
 
 ### Added

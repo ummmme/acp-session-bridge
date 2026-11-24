@@ -15,9 +15,12 @@ import {
 } from "../scripts/release.ts";
 import { VERSION } from "../src/version.ts";
 import {
+  assertNodePackageContents,
   createReleaseArchive,
+  packagedSkillFiles,
   releaseNames,
   type ReleaseTarget,
+  validateNodeArchiveEntries,
 } from "../scripts/release_package.ts";
 import {
   assertRuntimeLicenseInventoryMatchesLock,
@@ -59,6 +62,146 @@ test("release target and artifact names encode native platform/version", () => {
     if (!unsupportedRejected) {
       throw new Error(`Unsupported native target was accepted: ${os}-${arch}`);
     }
+  }
+});
+
+test("Node package contents whitelist skills and preserve source bytes", async () => {
+  const root = await nodeFs.makeTempDir({
+    prefix: "acp-mcp-node-package-test-",
+  });
+  try {
+    const packageRoot = `${root}/package`;
+    for (const directory of ["licenses", "skills/acp-mcp", "skills/gemini"]) {
+      await nodeFs.mkdir(`${packageRoot}/${directory}`, { recursive: true });
+    }
+    await nodeFs.writeText(
+      `${packageRoot}/node-manifest.json`,
+      "manifest fixture\n",
+    );
+    for (const relative of [
+      "acp-mcp.mjs",
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.txt",
+      "licenses/Apache-2.0.txt",
+      "licenses/MCP-SDK-MIT.txt",
+      "licenses/Zod-MIT.txt",
+    ]) {
+      const source = await nodeFs.readFile(
+        new URL(
+          relative === "acp-mcp.mjs" ? "../dist/acp-mcp.mjs" : `../${relative}`,
+          import.meta.url,
+        ),
+      );
+      await nodeFs.writeBytes(`${packageRoot}/${relative}`, source);
+    }
+    for (const relative of packagedSkillFiles) {
+      const source = await nodeFs.readFile(
+        new URL(`../.agents/${relative}`, import.meta.url),
+      );
+      await nodeFs.writeBytes(`${packageRoot}/${relative}`, source);
+    }
+    await assertNodePackageContents(packageRoot);
+
+    if (process.platform !== "win32") {
+      const archive = `${root}/node-fixture.zip`;
+      const members = [
+        "acp-mcp.mjs",
+        "node-manifest.json",
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.txt",
+        "licenses/Apache-2.0.txt",
+        "licenses/MCP-SDK-MIT.txt",
+        "licenses/Zod-MIT.txt",
+        ...packagedSkillFiles,
+      ];
+      const zipped = await new ProcessCommand("zip", {
+        args: ["-q", archive, ...members],
+        cwd: packageRoot,
+        stdin: "null",
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn().status;
+      if (!zipped.success) throw new Error("Could not create Node ZIP fixture");
+      await validateNodeArchiveEntries(archive);
+      const partialArchive = `${root}/node-fixture-missing-skill.zip`;
+      const partial = await new ProcessCommand("zip", {
+        args: [
+          "-q",
+          partialArchive,
+          ...members.filter((member) => member !== packagedSkillFiles[1]),
+        ],
+        cwd: packageRoot,
+        stdin: "null",
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn().status;
+      if (!partial.success) {
+        throw new Error("Could not create incomplete Node ZIP fixture");
+      }
+      let missingSkillRejected = false;
+      try {
+        await validateNodeArchiveEntries(partialArchive);
+      } catch (error) {
+        missingSkillRejected = String(error).includes(
+          "missing or unexpected paths",
+        );
+      }
+      if (!missingSkillRejected) {
+        throw new Error("Node ZIP accepted an omitted skill member");
+      }
+      await nodeFs.writeText(
+        `${packageRoot}/.acp-mcp.json`,
+        "private config\n",
+      );
+      const privateMember = await new ProcessCommand("zip", {
+        args: ["-q", archive, ".acp-mcp.json"],
+        cwd: packageRoot,
+        stdin: "null",
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn().status;
+      if (!privateMember.success) {
+        throw new Error("Could not add private Node ZIP fixture member");
+      }
+      let privateZipRejected = false;
+      try {
+        await validateNodeArchiveEntries(archive);
+      } catch (error) {
+        privateZipRejected = String(error).includes("unexpected paths");
+      }
+      await nodeFs.removePath(`${packageRoot}/.acp-mcp.json`);
+      if (!privateZipRejected) {
+        throw new Error("Node ZIP accepted a private configuration member");
+      }
+    }
+
+    await nodeFs.writeText(`${packageRoot}/.acp-mcp.json`, "private config\n");
+    let privateConfigRejected = false;
+    try {
+      await assertNodePackageContents(packageRoot);
+    } catch (error) {
+      privateConfigRejected = String(error).includes("unexpected paths");
+    }
+    await nodeFs.removePath(`${packageRoot}/.acp-mcp.json`);
+    if (!privateConfigRejected) {
+      throw new Error("Node package accepted a private configuration file");
+    }
+
+    await nodeFs.writeText(
+      `${packageRoot}/${packagedSkillFiles[0]}`,
+      "changed skill bytes\n",
+    );
+    let changedSkillRejected = false;
+    try {
+      await assertNodePackageContents(packageRoot);
+    } catch (error) {
+      changedSkillRejected = String(error).includes("skill text mismatch");
+    }
+    if (!changedSkillRejected) {
+      throw new Error("Node package accepted changed skill bytes");
+    }
+  } finally {
+    await nodeFs.removePath(root, { recursive: true });
   }
 });
 

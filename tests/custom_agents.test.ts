@@ -239,9 +239,13 @@ test("trusted custom ACP agents use the generic MCP, policy, and session path", 
         "high"
     )
       throw new Error("New session did not observe updated project policy");
-    for (const sessionId of [firstId, secondId]) {
-      await mcp.callTool("close_session", { sessionId }).response;
-    }
+    const closedIdle = parseToolResult(
+      await mcp.callTool("close_session", { sessionId: firstId, ifIdle: true })
+        .response,
+    );
+    if (closedIdle.closed !== true)
+      throw new Error("Expected an idle session to close");
+    await mcp.callTool("close_session", { sessionId: secondId }).response;
     const sessions = parseToolResult(
       await mcp.callTool("list_sessions", {}).response,
     );

@@ -37,6 +37,8 @@ jobs:
       - run: npm run build
       - run: node scripts/node_archive.ts create
       - run: node scripts/node_archive.ts stage
+      - name: Verify the installable Node archive
+        run: node scripts/verify_public_release.ts dist/github-release-assets node
       - uses: actions/upload-artifact@v4
         with:
           name: release-node
@@ -79,6 +81,8 @@ jobs:
         env:
           ACPMCP_EXPECTED_RELEASE_TARGET: ${{ matrix.target }}
         run: node scripts/github_release_assets.ts stage
+      - name: Verify the installable native archive
+        run: node scripts/verify_public_release.ts dist/github-release-assets ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
@@ -112,7 +116,7 @@ jobs:
           version="${RELEASE_TAG#v}"
           gh release create "$RELEASE_TAG" release-assets/* \
             --repo "$GH_REPO" --verify-tag --generate-notes \
-            --notes "This release migrates the runtime from Deno to Node.js following [Deno's announcement that its team is joining Cloudflare](https://deno.com/blog/cloudflare)." \
+            --notes "Packages include the MCP server and companion Skills. See [the changelog](https://github.com/$GH_REPO/blob/$RELEASE_TAG/CHANGELOG.md) and [installation instructions](https://github.com/$GH_REPO/blob/$RELEASE_TAG/README.md)." \
             --title "acp-mcp $version"
 
   verify-public:

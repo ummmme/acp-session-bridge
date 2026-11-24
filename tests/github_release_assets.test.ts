@@ -10,6 +10,7 @@ import {
   createReleaseArchive,
   extractReleaseArchive,
   releaseNames,
+  packagedSkillFiles,
   type ReleaseTarget,
   sha256File,
   sha256Hex,
@@ -151,6 +152,17 @@ test("GitHub assets are self-contained licensed archives for all targets", async
           await nodeFs.stat(`${extracted}/${path}`);
         } catch {
           throw new Error(`${target} archive omitted ${path}`);
+        }
+      }
+      for (const relative of packagedSkillFiles) {
+        const packagedBytes = await nodeFs.readFile(`${extracted}/${relative}`);
+        const sourceBytes = await nodeFs.readFile(
+          new URL(`../.agents/${relative}`, import.meta.url),
+        );
+        if (!Buffer.from(packagedBytes).equals(Buffer.from(sourceBytes))) {
+          throw new Error(
+            `${target} archive changed skill bytes for ${relative}`,
+          );
         }
       }
       if (

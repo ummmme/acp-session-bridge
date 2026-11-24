@@ -32,6 +32,7 @@ import {
 import {
   DEFAULT_ASYNC_CONFIG_OPTION_TIMEOUT_MS,
   SessionManager,
+  type SessionEvent,
 } from "../sessions/manager.ts";
 import { cleanupStaleWorkspaceSnapshots } from "../workspaces/stale_cleanup.ts";
 import { VERSION } from "../version.ts";
@@ -58,6 +59,86 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   return Promise.race([promise, cancelled]).finally(() => {
     if (abort) signal.removeEventListener("abort", abort);
   });
+}
+
+function safePromptFailure(
+  prompt: {
+    state: string;
+    error?: string;
+    errorCode?: number;
+    errorData?: unknown;
+  },
+  agentId: string,
+  agents: AgentMap,
+  failureClassifiers: AgentFailureClassifiers,
+): { error: string; errorCode?: number } | undefined {
+  if (prompt.state !== "failed") return undefined;
+  const classification = classifyAgentFailure(
+    agents,
+    failureClassifiers,
+    agentId,
+    {
+      agentId,
+      stage: "prompt",
+      acpCode: prompt.errorCode,
+      errorMessage: prompt.error,
+      errorData: prompt.errorData,
+    },
+  );
+  let error =
+    "The ACP provider failed to complete the prompt. Check its authentication and configuration, inspect provider logs, then retry.";
+  if (classification?.reason === "rate_limited" || prompt.errorCode === 429) {
+    error =
+      "The provider rate limit or quota was reached. Check quota or wait before retrying.";
+  } else if (prompt.errorCode === 401 || prompt.errorCode === 403) {
+    error =
+      "Provider authentication or authorization failed. Verify the configured credentials and permissions, then retry.";
+  } else if ([502, 503, 504].includes(prompt.errorCode ?? 0)) {
+    error =
+      "The provider is temporarily unreachable. Check connectivity and provider status, then retry.";
+  }
+  return {
+    error,
+    ...(Number.isSafeInteger(prompt.errorCode)
+      ? { errorCode: prompt.errorCode }
+      : {}),
+  };
+}
+
+function sanitizeV2FailureUpdate(
+  value: unknown,
+  failure: { error: string; errorCode?: number },
+): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const update = value as Record<string, unknown>;
+  if (update.state !== "idle" || update.stopReason !== "error") return value;
+  const error = {
+    ...(failure.errorCode === undefined ? {} : { code: failure.errorCode }),
+    message: failure.error,
+  };
+  return { ...update, error };
+}
+
+function sanitizeV2FailureEvent(
+  event: SessionEvent,
+  failure: { error: string; errorCode?: number },
+): SessionEvent {
+  if (event.kind !== "state_update") return event;
+  const update = sanitizeV2FailureUpdate(event.update, failure);
+  const raw = event.raw;
+  const sanitizedRaw =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (() => {
+          const params = raw as Record<string, unknown>;
+          return Object.hasOwn(params, "update")
+            ? {
+                ...params,
+                update: sanitizeV2FailureUpdate(params.update, failure),
+              }
+            : raw;
+        })()
+      : raw;
+  return { ...event, update, raw: sanitizedRaw };
 }
 
 function runTaskFailure(
@@ -614,9 +695,32 @@ export function createMcpServer(
             },
             config,
           );
-          const result = prompt
-            ? await manager.prompt(session.id, prompt)
+          const promptRecord = prompt
+            ? manager.beginPrompt(session.id, prompt)
             : undefined;
+          if (promptRecord) await promptRecord.done;
+          const result = promptRecord
+            ? promptRecord.state === "failed"
+              ? promptRecord
+              : {
+                  stopReason: promptRecord.stopReason,
+                  text: promptRecord.text,
+                }
+            : undefined;
+          const safeResult =
+            promptRecord?.state === "failed"
+              ? {
+                  state: promptRecord.state,
+                  text: promptRecord.text,
+                  stopReason: promptRecord.stopReason,
+                  ...safePromptFailure(
+                    promptRecord,
+                    agentId,
+                    resolved.agents,
+                    failureClassifiers,
+                  ),
+                }
+              : result;
           return {
             content: [
               {
@@ -626,7 +730,7 @@ export function createMcpServer(
                   acpSessionId: session.acpSessionId,
                   agentId,
                   acpProtocol: session.acpProtocol,
-                  result,
+                  result: safeResult,
                 }),
               },
             ],
@@ -1281,6 +1385,12 @@ export function createMcpServer(
       try {
         const prompt = manager.beginPrompt(sessionId, text);
         if (wait) await manager.waitPrompt(sessionId, prompt.id, waitMs);
+        const failure = safePromptFailure(
+          prompt,
+          manager.getSessionSnapshot(sessionId).agentId,
+          agents,
+          failureClassifiers,
+        );
         return {
           content: [
             {
@@ -1290,7 +1400,10 @@ export function createMcpServer(
                 state: prompt.state,
                 text: prompt.text,
                 stopReason: prompt.stopReason,
-                error: prompt.error,
+                error: failure?.error ?? prompt.error,
+                ...(failure?.errorCode === undefined
+                  ? {}
+                  : { errorCode: failure.errorCode }),
               }),
             },
           ],
@@ -1304,7 +1417,7 @@ export function createMcpServer(
     "get_events",
     {
       description:
-        "Read buffered ACP session updates after a sequence cursor. Pass nextSequence as afterSequence to read the next page, even when hidden thoughts leave an empty page. An unchanged cursor means there are no newer buffered events. gap reports dropped events.",
+        "Read buffered ACP session updates after a sequence cursor. Pass nextSequence as afterSequence to read the next page, even when hidden thoughts leave an empty page. An unchanged cursor means there are no newer buffered events. gap reports dropped events. includePromptText defaults to true; set it to false to omit accumulated prompt text.",
       annotations: {
         title: "Get ACP events",
         readOnlyHint: true,
@@ -1325,6 +1438,7 @@ export function createMcpServer(
         waitMs: z.number().int().min(0).max(30000).optional(),
         includeRaw: z.boolean().optional(),
         includeThoughts: z.boolean().optional(),
+        includePromptText: z.boolean().optional(),
       },
     },
     async ({
@@ -1334,6 +1448,7 @@ export function createMcpServer(
       waitMs = 0,
       includeRaw = false,
       includeThoughts = false,
+      includePromptText = true,
     }) => {
       try {
         if (
@@ -1342,17 +1457,48 @@ export function createMcpServer(
         )
           await new Promise((resolve) => setTimeout(resolve, waitMs));
         const result = manager.getEvents(sessionId, afterSequence, limit);
+        const failureSnapshot =
+          result.prompt?.state === "failed"
+            ? manager.getSessionSnapshot(sessionId)
+            : undefined;
+        const failure = failureSnapshot
+          ? safePromptFailure(
+              failureSnapshot.prompt?.state === "failed"
+                ? failureSnapshot.prompt
+                : result.prompt!,
+              failureSnapshot.agentId,
+              agents,
+              failureClassifiers,
+            )
+          : undefined;
         const events = result.events
           .filter(
             (event) =>
               includeThoughts || !event.kind.toLowerCase().includes("thought"),
           )
-          .map(({ raw, ...event }) => (includeRaw ? { ...event, raw } : event));
+          .map((event) => {
+            const sanitizedEvent =
+              failureSnapshot?.acpProtocol === "v2" && failure
+                ? sanitizeV2FailureEvent(event, failure)
+                : event;
+            const { raw, ...publicEvent } = sanitizedEvent;
+            return includeRaw ? { ...publicEvent, raw } : publicEvent;
+          });
+        const prompt = result.prompt
+          ? (() => {
+              const { text, ...summary } = result.prompt;
+              return {
+                ...summary,
+                ...(includePromptText ? { text } : {}),
+                ...(failure ?? {}),
+              };
+            })()
+          : undefined;
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify({ ...result, events }),
+              text: JSON.stringify({ ...result, events, prompt }),
             },
           ],
         };
@@ -1440,7 +1586,8 @@ export function createMcpServer(
   server.registerTool(
     "get_session",
     {
-      description: "Get capabilities and live configuration metadata",
+      description:
+        "Get capabilities and live configuration metadata. includePromptText defaults to true; set it to false to omit accumulated prompt text.",
       annotations: {
         title: "Get ACP session",
         readOnlyHint: true,
@@ -1448,9 +1595,12 @@ export function createMcpServer(
         idempotentHint: true,
         openWorldHint: false,
       },
-      inputSchema: { sessionId: z.string() },
+      inputSchema: {
+        sessionId: z.string(),
+        includePromptText: z.boolean().optional(),
+      },
     },
-    ({ sessionId }) => {
+    ({ sessionId, includePromptText = true }) => {
       try {
         const s = manager.getSessionSnapshot(sessionId);
         return {
@@ -1473,8 +1623,14 @@ export function createMcpServer(
                   ? {
                       id: s.prompt.id,
                       state: s.prompt.state,
-                      text: s.prompt.text,
+                      ...(includePromptText ? { text: s.prompt.text } : {}),
                       stopReason: s.prompt.stopReason,
+                      ...(safePromptFailure(
+                        s.prompt,
+                        s.agentId,
+                        agents,
+                        failureClassifiers,
+                      ) ?? {}),
                     }
                   : undefined,
                 nextSequence: s.nextSequence - 1,
@@ -1615,16 +1771,30 @@ export function createMcpServer(
         idempotentHint: true,
         openWorldHint: true,
       },
-      inputSchema: { sessionId: z.string() },
+      inputSchema: {
+        sessionId: z.string(),
+        ifIdle: z
+          .boolean()
+          .optional()
+          .describe(
+            "Only close if there is no running prompt or pending approval",
+          ),
+      },
     },
-    async ({ sessionId }) => {
+    async ({ sessionId, ifIdle = false }) => {
       try {
-        await manager.close(sessionId);
+        let closed = true;
+        if (ifIdle) closed = await manager.closeIfIdle(sessionId);
+        else await manager.close(sessionId);
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify({ closed: true, sessionId }),
+              text: JSON.stringify(
+                closed
+                  ? { closed, sessionId }
+                  : { closed, sessionId, reason: "busy" },
+              ),
             },
           ],
         };

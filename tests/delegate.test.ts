@@ -543,6 +543,15 @@ test("operator delegation returns a minimal handoff and expires its lease", asyn
     if (continuation.status !== "permission_required") {
       throw new Error("Second operator handoff failed");
     }
+    const busy = parseToolResult(
+      await mcp.callTool("close_session", {
+        sessionId: continuation.sessionId,
+        ifIdle: true,
+      }).response,
+    );
+    if (busy.closed !== false || busy.reason !== "busy") {
+      throw new Error("Guarded close must preserve a pending approval");
+    }
     const resolved = await mcp.callTool("resolve_permission", {
       sessionId: continuation.sessionId,
       permissionId: continuation.permissionId,

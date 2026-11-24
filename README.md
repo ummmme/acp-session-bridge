@@ -10,17 +10,33 @@ This is a fork of [kxress/acp-mcp](https://github.com/kxress/acp-mcp). The serve
 
 ## Quick start: Claude Code and Antigravity CLI
 
-**Prerequisites:** Node.js 24.12.0 or newer, npm, Claude Code, and an installed, authenticated `agy` with the `acp` subcommand. The shell commands below are for macOS or Linux.
+**Install the server and the two Skills from the same 0.3.0 package.** The service provides MCP tools; the [`acp-mcp` Skill](.agents/skills/acp-mcp/SKILL.md) explains how to use them with any ACP agent, and [`gemini`](.agents/skills/gemini/SKILL.md) adds project-scoped follow-ups and session commands in Claude Code. Automation clients can also call the tools directly.
 
-**1. Build this fork.** Keep the checkout in a stable location: Claude Code will launch the bundle from that directory.
+**Prerequisites:** Claude Code and an authenticated `agy` with the `acp` subcommand. The Node package requires Node.js 24.12.0 or newer; the native executable includes its runtime. These shell examples use macOS or Linux.
+
+**1. Extract a package into a new, stable directory.** Download the Node ZIP or a native archive for your platform from [Releases](https://github.com/ummmme/acp-session-bridge/releases) or a [successful candidate build](https://github.com/ummmme/acp-session-bridge/actions/workflows/release.yml). Verify its SHA-256, then run the commands below from the extracted archive root. Each package contains `skills/acp-mcp/SKILL.md` and `skills/gemini/SKILL.md`.
 
 ```sh
-git clone https://github.com/ummmme/acp-session-bridge.git
-cd acp-session-bridge
-npm ci
-npm run build
-node dist/acp-mcp.mjs --version
+# Node ZIP:
+node ./acp-mcp.mjs --version
+# Native archive instead: ./acp-mcp --version (acp-mcp.exe on Windows)
 ```
+
+Install both Skills in your Claude Code user directory. On first install:
+
+```sh
+mkdir -p "$HOME/.claude/skills"
+for name in acp-mcp gemini; do
+  dest="$HOME/.claude/skills/$name"
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    printf 'Already installed: %s. Compare and back up before upgrading.\n' "$dest"
+  else
+    cp -R "skills/$name" "$dest"
+  fi
+done
+```
+
+For a source checkout, run `npm ci && npm run build` and use `dist/acp-mcp.mjs` and `.agents/skills/` in place of the archive paths. On Windows, copy both skill directories into `%USERPROFILE%\.claude\skills\` and register the absolute path to `acp-mcp.exe` or the Node bundle.
 
 **2. Configure the agent.** Find the executable with `command -v agy`. In `~/.acp-mcp.json`, add the following entry under `agents` (preserve any existing entries). Replace the example path with the absolute path printed by your shell.
 
@@ -38,15 +54,17 @@ node dist/acp-mcp.mjs --version
 
 This launches `agy acp` directly. The built-in `antigravity-acp` profile is a different launch route. Its optional `implementation: "agy"` uses a separate adapter that skips tool permission prompts.
 
-**3. Register and verify the bridge.** Run this from the checkout you built. `--scope user` makes the server available across projects; `--config` selects the exact configuration file instead of merging repository configuration.
+**3. Register and verify the bridge.** From the extracted Node archive, register the server with the same name the Gemini Skill will use. Keep this directory after registration. `--scope user` makes the server available across projects; `--config` selects only the specified configuration file.
 
 ```sh
 claude mcp add --scope user --transport stdio acp-session-bridge -- \
-  "$(command -v node)" "$PWD/dist/acp-mcp.mjs" --config "$HOME/.acp-mcp.json"
+  “$(command -v node)” “$PWD/acp-mcp.mjs” --config “$HOME/.acp-mcp.json”
 claude mcp get acp-session-bridge
 ```
 
-`Connected` verifies the MCP connection. In Claude Code, ask **“Use `acp-session-bridge` to list the models advertised by `local-agy`.”** A model list verifies the downstream ACP connection as well. Select the model from that list: the interactive CLI and ACP interface can offer different choices.
+For the native archive, use `”$PWD/acp-mcp” --config “$HOME/.acp-mcp.json”` after `--` instead. `Connected` verifies the bridge. Open Claude Code in a project, start with `/gemini list`, then try `/gemini new Remember the test word cedar` followed by `/gemini Which word did I give you?`. A returned answer from the same session verifies the downstream connection. `/gemini new` opens another session without closing the first; `/gemini use A` switches back and `/gemini close A` closes it only when idle.
+
+If you already registered the service under another name, keep that registration and configure the Skill to use it. The optional personal file `~/.config/acp-session-bridge/gemini.json` holds the MCP server name, agent ID, and your preferred model (selected from the agent's live model catalog). Do not put credentials there.
 
 Other MCP hosts can use the same stdio command and arguments. To connect a different agent, choose a [built-in profile](src/agents/registry_profiles.ts) or configure its stdio executable in the trusted configuration file. Install and authenticate each downstream agent separately.
 
@@ -61,10 +79,10 @@ For an ongoing review:
 
 1. Call `start_session` with `agentId: "local-agy"`, an absolute project `cwd`, and `permissionPolicy: "operator"` if the host will handle approvals. Leave out the initial prompt so the caller obtains both session IDs before work begins.
 2. Call `prompt` with the **bridge** `sessionId`, the review instructions in `text`, and `wait: false`. Save the returned `promptId`.
-3. Poll `get_events`. Pass each `nextSequence` back as `afterSequence`, even when the visible event list is empty. Check the matching prompt snapshot for its terminal state and stop reason. With `operator`, inspect pending requests via `get_session` and pass an offered option ID to `resolve_permission`.
-4. An `end_turn` finishes the answer. Stop polling and keep the session for the next question. Use `close_session` when finished with the **session**; closing a running session can cancel its prompt.
+3. Poll `get_events` with `includePromptText: false`. Use `get_session` with the same flag to check approvals without repeating the full answer. Pass each `nextSequence` back as `afterSequence`, even on empty pages. Use an offered option ID to resolve each pending permission request.
+4. For the matching `promptId`, `completed` with `end_turn` finishes the answer. Read `get_session` once with `includePromptText: true` and stop polling. Use `close_session` with `ifIdle: true` for manual cleanup: `closed: false, reason: "busy"` preserves running work and pending approvals. Omitting the guard retains the cancel-and-close behavior.
 
-The bridge on `master` supports **eight managed sessions per server process**. `list_sessions` shows the handles owned by that process. After a bridge restart, use the downstream `acpSessionId`, agent ID, and original working directory with `load_session` if the downstream agent supports resumption.
+The default limit is **20 managed sessions per server process**, including sessions starting up or shutting down. Finishing a turn keeps its session available. `list_sessions` shows the active handles; reuse one instead of loading the same downstream session twice. After a bridge restart, use the downstream `acpSessionId`, agent ID, and original workspace with `load_session` if the agent supports resumption.
 
 ## Configuration and permissions
 

@@ -4,10 +4,13 @@ import * as nodeFs from "#fs";
 import { join, resolve } from "node:path";
 import { VERSION } from "../src/version.ts";
 import {
+  assertNodePackageContents,
+  assertPackagedSkillFilesMatch,
   checksumText,
   extractReleaseArchive,
   releaseNames,
   sha256File,
+  validateNodeArchiveEntries,
   validatePackageManifest,
   validateReleaseManifest,
 } from "./release_package.ts";
@@ -46,21 +49,16 @@ if (targetArg === "node") {
   }
   const manifest = JSON.parse(
     await nodeFs.readText(join(directory, manifestName)),
-  ) as {
-    version?: string;
-    runtime?: string;
-    entry?: string;
-    entrySha256?: string;
-    archive?: string;
-    archiveSha256?: string;
-  };
+  ) as Record<string, unknown>;
   const archiveHash = await sha256File(join(directory, archive));
   if (
+    manifest.product !== "acp-mcp" ||
     manifest.version !== VERSION ||
     manifest.runtime !== "node >=24.12.0" ||
     manifest.entry !== "acp-mcp.mjs" ||
     manifest.archive !== archive ||
     manifest.archiveSha256 !== archiveHash ||
+    Object.keys(manifest).length !== 7 ||
     (await nodeFs.readText(join(directory, checksumName))) !==
       checksumText(archiveHash, archive)
   ) {
@@ -68,6 +66,7 @@ if (targetArg === "node") {
       "Downloaded Node release checksum or manifest does not match",
     );
   }
+  await validateNodeArchiveEntries(join(directory, archive));
   const extractedNode = await nodeFs.makeTempDir({
     prefix: "acp-mcp-node-verify-",
   });
@@ -79,14 +78,17 @@ if (targetArg === "node") {
     }).output();
     if (!unzip.success)
       throw new Error("Could not extract downloaded Node release ZIP");
+    await assertNodePackageContents(extractedNode);
     const embedded = JSON.parse(
       await nodeFs.readText(join(extractedNode, "node-manifest.json")),
     ) as typeof manifest;
     if (
+      embedded.product !== "acp-mcp" ||
       embedded.version !== manifest.version ||
       embedded.runtime !== manifest.runtime ||
       embedded.entry !== manifest.entry ||
       embedded.entrySha256 !== manifest.entrySha256 ||
+      Object.keys(embedded).length !== 5 ||
       (await sha256File(join(extractedNode, "acp-mcp.mjs"))) !==
         manifest.entrySha256
     ) {
@@ -146,6 +148,7 @@ const extracted = await nodeFs.makeTempDir({
 });
 try {
   await extractReleaseArchive(archivePath, targetArg, extracted);
+  await assertPackagedSkillFilesMatch(extracted);
   const packageManifest = validatePackageManifest(
     JSON.parse(await nodeFs.readText(join(extracted, "manifest.json"))),
   );
