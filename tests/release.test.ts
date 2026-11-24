@@ -78,8 +78,8 @@ test("Node package contents whitelist skills and preserve source bytes", async (
       `${packageRoot}/node-manifest.json`,
       "manifest fixture\n",
     );
+    await nodeFs.writeText(`${packageRoot}/acp-mcp.mjs`, "export {};\n");
     for (const relative of [
-      "acp-mcp.mjs",
       "LICENSE",
       "THIRD_PARTY_NOTICES.txt",
       "licenses/Apache-2.0.txt",
@@ -87,10 +87,7 @@ test("Node package contents whitelist skills and preserve source bytes", async (
       "licenses/Zod-MIT.txt",
     ]) {
       const source = await nodeFs.readFile(
-        new URL(
-          relative === "acp-mcp.mjs" ? "../dist/acp-mcp.mjs" : `../${relative}`,
-          import.meta.url,
-        ),
+        new URL(`../${relative}`, import.meta.url),
       );
       await nodeFs.writeBytes(`${packageRoot}/${relative}`, source);
     }
