@@ -1,3 +1,6 @@
+# Forked from kxress/acp-mcp (https://github.com/kxress/acp-mcp). 
+This fork focuses on session ownership, lightweight polling, and clearer diagnostics for asynchronous failures.
+
 # acp-mcp
 
 **Control ACP coding agents programmatically through MCP.**
