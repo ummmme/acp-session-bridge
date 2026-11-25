@@ -1,44 +1,93 @@
 # ACP Session Bridge
 
-Use a local coding agent from an MCP client and keep the conversation open for follow-up questions. For example, Claude Code can ask Gemini to review a diff through Antigravity CLI, inspect the result, and ask about a specific finding in the same session.
+A local bridge that connects Claude Code to Gemini using your existing Antigravity CLI (`agy`) sign-in. Type `/gemini` to get a second opinion on a plan or code change, ask follow-up questions in the same session, or start a separate review without losing the first conversation.
+
+[Download v0.3.0](https://github.com/ummmme/acp-session-bridge/releases/tag/v0.3.0) · [中文 README](./README.zh.md)
 
 ```text
-Claude Code (MCP client) ──MCP──> acp-mcp ──ACP──> agy acp ──> Gemini
+/gemini Review the plan we just discussed: what's wrong with defining CTR as total clicks divided by sessions?
+/gemini Turn that counterexample into a concrete set of numbers.
+/gemini new Independently review this formula from a QA perspective: CTR = total clicks / sessions.
 ```
 
-This is a fork of [kxress/acp-mcp](https://github.com/kxress/acp-mcp). The server and build artifact retain the name `acp-mcp`. The host decides what to delegate; the downstream agent supplies the models, credentials, and tools.
+## Features
 
-## Quick start: Claude Code and Antigravity CLI
+- **In-chat reviews**: Invoke `/gemini` directly inside Claude Code. Claude passes along the relevant context, and Gemini can read the project files you authorize—no terminal switching or manual copy-pasting.
+- **Session continuity**: Follow-up prompts in the same Claude Code conversation and project automatically continue the active Gemini session. Gemini stays idle between turns; closing a Gemini session does not close Claude Code.
+- **Multiple threads per project**: Use `/gemini new` to start an independent review thread. Sessions are labeled `A`, `B`, etc., and can be listed with `/gemini list` or switched with `/gemini use`.
+- **Other ACP agents**: Beyond `agy`, the bridge can connect to other local coding agents that speak the ACP protocol.
 
-**Install the server and the two Skills from the same 0.3.0 package.** The service provides MCP tools; the [`acp-mcp` Skill](.agents/skills/acp-mcp/SKILL.md) explains how to use them with any ACP agent, and [`gemini`](.agents/skills/gemini/SKILL.md) adds project-scoped follow-ups and session commands in Claude Code. Automation clients can also call the tools directly.
+## Prerequisites
 
-**Prerequisites:** Claude Code and an authenticated `agy` with the `acp` subcommand. The Node package requires Node.js 24.12.0 or newer; the native executable includes its runtime. These shell examples use macOS or Linux.
+- A working [Claude Code](https://code.claude.com/docs/en/quickstart) installation
+- **Antigravity CLI** (`agy`) installed and signed in locally:
+  - Install: [Antigravity CLI](https://antigravity.google/product/antigravity-cli)
+  - Sign in: [Official login guide](https://antigravity.google/docs/install)
+- Node.js **24.12.0** or later if using the Node ZIP or building from source (native bundles include the runtime).
 
-**1. Extract a package into a new, stable directory.** Download the Node ZIP or a native archive for your platform from [Releases](https://github.com/ummmme/acp-session-bridge/releases) or a [successful candidate build](https://github.com/ummmme/acp-session-bridge/actions/workflows/release.yml). Verify its SHA-256, then run the commands below from the extracted archive root. Each package contains `skills/acp-mcp/SKILL.md` and `skills/gemini/SKILL.md`.
+Verify in your terminal that `agy` supports ACP:
 
 ```sh
-# Node ZIP:
-node ./acp-mcp.mjs --version
-# Native archive instead: ./acp-mcp --version (acp-mcp.exe on Windows)
+agy help acp
 ```
 
-Install both Skills in your Claude Code user directory. On first install:
+You should see `Usage: agy acp` and help output. If you haven't signed in with your Google account yet, run `agy acp --login`.
+
+## Installation & Setup
+
+> Run setup commands in your **system terminal**, and enter `/gemini` commands in the **Claude Code chat input**. Windows users can jump to [Windows Setup](#windows-setup).
+
+### 1. Download and extract to a permanent directory
+
+Download the matching archive from the **Assets** section of [v0.3.0 Releases](https://github.com/ummmme/acp-session-bridge/releases/tag/v0.3.0):
+
+| Platform | Archive |
+| --- | --- |
+| Apple Silicon Mac (M-series) | `acp-mcp-0.3.0-macos-arm64.tar.gz` |
+| Intel Mac | `acp-mcp-0.3.0-node.zip` (requires Node.js >= 24.12.0) |
+| Linux x86_64 | `acp-mcp-0.3.0-linux-x86_64.tar.gz` |
+| Windows x86_64 | `acp-mcp-0.3.0-windows-x86_64.zip` |
+
+<details>
+<summary>Optional: Verify the SHA-256 checksum</summary>
+
+Run this in your download directory with the archive and its matching `.sha256` file side by side.
+
+```sh
+# macOS (for Intel Mac, substitute the Node ZIP .sha256 filename)
+shasum -a 256 -c acp-mcp-0.3.0-macos-arm64.tar.gz.sha256
+```
+
+```sh
+# Linux
+sha256sum -c acp-mcp-0.3.0-linux-x86_64.tar.gz.sha256
+```
+
+Confirm the output ends with `OK`.
+
+</details>
+
+Extract the archive to a **permanent directory** and `cd` into it (you should see `skills/` inside). Claude Code launches the server from this path—moving or deleting the directory later will break the connection.
+
+The macOS native binary is not Apple-notarized; if macOS blocks it from running, use `acp-mcp-0.3.0-node.zip` instead.
+
+### 2. Install Skills and configure `agy`
+
+The release includes two Skills: `gemini` provides the `/gemini` command, and `acp-mcp` guides Claude when working with other local ACP agents. From the extracted directory, run (existing Skills are skipped to prevent accidental overwrites):
 
 ```sh
 mkdir -p "$HOME/.claude/skills"
 for name in acp-mcp gemini; do
   dest="$HOME/.claude/skills/$name"
   if [ -e "$dest" ] || [ -L "$dest" ]; then
-    printf 'Already installed: %s. Compare and back up before upgrading.\n' "$dest"
+    printf 'Already exists—compare before upgrading: %s\n' "$dest"
   else
     cp -R "skills/$name" "$dest"
   fi
 done
 ```
 
-For a source checkout, run `npm ci && npm run build` and use `dist/acp-mcp.mjs` and `.agents/skills/` in place of the archive paths. On Windows, copy both skill directories into `%USERPROFILE%\.claude\skills\` and register the absolute path to `acp-mcp.exe` or the Node bundle.
-
-**2. Configure the agent.** Find the executable with `command -v agy`. In `~/.acp-mcp.json`, add the following entry under `agents` (preserve any existing entries). Replace the example path with the absolute path printed by your shell.
+Next, run `command -v agy` to get its absolute path. Create `~/.acp-mcp.json` in your home directory and replace `command` with the actual path (if the file already exists, keep your existing entries and merge only `agents.local-agy`):
 
 ```json
 {
@@ -52,62 +101,129 @@ For a source checkout, run `npm ci && npm run build` and use `dist/acp-mcp.mjs` 
 }
 ```
 
-This launches `agy acp` directly. The built-in `antigravity-acp` profile is a different launch route. Its optional `implementation: "agy"` uses a separate adapter that skips tool permission prompts.
+### 3. Register the MCP server
 
-**3. Register and verify the bridge.** From the extracted Node archive, register the server with the same name the Gemini Skill will use. Keep this directory after registration. `--scope user` makes the server available across projects; `--config` selects only the specified configuration file.
+Still in the extracted directory, run the command matching your package.
+
+macOS / Linux native bundle:
 
 ```sh
 claude mcp add --scope user --transport stdio acp-session-bridge -- \
-  “$(command -v node)” “$PWD/acp-mcp.mjs” --config “$HOME/.acp-mcp.json”
+  "$PWD/acp-mcp" --config "$HOME/.acp-mcp.json"
+```
+
+Node ZIP:
+
+```sh
+claude mcp add --scope user --transport stdio acp-session-bridge -- \
+  "$(command -v node)" "$PWD/acp-mcp.mjs" --config "$HOME/.acp-mcp.json"
+```
+
+Check the connection status:
+
+```sh
 claude mcp get acp-session-bridge
 ```
 
-For the native archive, use `”$PWD/acp-mcp” --config “$HOME/.acp-mcp.json”` after `--` instead. `Connected` verifies the bridge. Open Claude Code in a project, start with `/gemini list`, then try `/gemini new Remember the test word cedar` followed by `/gemini Which word did I give you?`. A returned answer from the same session verifies the downstream connection. `/gemini new` opens another session without closing the first; `/gemini use A` switches back and `/gemini close A` closes it only when idle.
+Seeing **`Status: ✔ Connected`** confirms registration succeeded.
 
-If you already registered the service under another name, keep that registration and configure the Skill to use it. The optional personal file `~/.config/acp-session-bridge/gemini.json` holds the MCP server name, agent ID, and your preferred model (selected from the agent's live model catalog). Do not put credentials there.
+### Windows Setup
 
-Other MCP hosts can use the same stdio command and arguments. To connect a different agent, choose a [built-in profile](src/agents/registry_profiles.ts) or configure its stdio executable in the trusted configuration file. Install and authenticate each downstream agent separately.
+<details>
+<summary>Expand Windows x86_64 PowerShell steps</summary>
 
-## One question or an ongoing review?
+Complete the Prerequisites check first. In PowerShell, `cd` into your download directory and optionally verify the checksum:
 
-| Need | MCP tools | What to keep |
-| --- | --- | --- |
-| One answer | `run_task` with `agentId`, `cwd`, and `task` | The returned result |
-| Follow-up questions, progress, or approvals | `start_session`, then `prompt` and `get_events` | The bridge `sessionId` and downstream `acpSessionId` |
-
-For an ongoing review:
-
-1. Call `start_session` with `agentId: "local-agy"`, an absolute project `cwd`, and `permissionPolicy: "operator"` if the host will handle approvals. Leave out the initial prompt so the caller obtains both session IDs before work begins.
-2. Call `prompt` with the **bridge** `sessionId`, the review instructions in `text`, and `wait: false`. Save the returned `promptId`.
-3. Poll `get_events` with `includePromptText: false`. Use `get_session` with the same flag to check approvals without repeating the full answer. Pass each `nextSequence` back as `afterSequence`, even on empty pages. Use an offered option ID to resolve each pending permission request.
-4. For the matching `promptId`, `completed` with `end_turn` finishes the answer. Read `get_session` once with `includePromptText: true` and stop polling. Use `close_session` with `ifIdle: true` for manual cleanup: `closed: false, reason: "busy"` preserves running work and pending approvals. Omitting the guard retains the cancel-and-close behavior.
-
-The default limit is **20 managed sessions per server process**, including sessions starting up or shutting down. Finishing a turn keeps its session available. `list_sessions` shows the active handles; reuse one instead of loading the same downstream session twice. After a bridge restart, use the downstream `acpSessionId`, agent ID, and original workspace with `load_session` if the agent supports resumption.
-
-## Configuration and permissions
-
-- **Project policy:** Without `--config`, the bridge merges the home `.acp-mcp.json` with project files from outer to inner directories. A new or resumed session captures the effective configuration. Executables, arguments, environment variables, and protocol selection belong in trusted home or explicit configuration.
-- **Model choice:** Explicit selections take precedence over configured and downstream defaults. Model allow/deny rules still apply. Use `list_models` to discover live choices and `get_session` to check an active session's configuration.
-- **File access:** `permissionPolicy` controls how the bridge answers **ACP permission requests**. The child runs with the operating-system privileges of its launcher and may read or write files directly. Use an OS-enforced read-only workspace for reviews that must never change source files.
-- **Diagnostics:** `node dist/acp-mcp.mjs doctor --json` checks local configuration and launch prerequisites offline. For login, quota, or model availability, check the downstream agent. Keep event logs private: they may contain prompts, file paths, or tool output.
-
-## Checks, builds, and releases
-
-```sh
-npm run check         # TypeScript
-npm test              # Test suite
-npm run lint
-npm run format:check
-npm run build         # dist/acp-mcp.mjs
+```powershell
+$archive = 'acp-mcp-0.3.0-windows-x86_64.zip'
+$expected = ((Get-Content "$archive.sha256" -Raw).Trim() -split '\s+')[0]
+if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) { throw 'SHA-256 verification failed' }
 ```
 
-The [GitHub Actions workflow](.github/workflows/release.yml) runs on pushes to `master` or `v*` tags, and on manual dispatch. It checks and builds the Node package and produces standalone executables for **Windows x86_64, Linux x86_64, and macOS ARM64**. Native builds use Node.js 26; the JavaScript bundle runs with Node.js 24.12.0 or newer.
+Extract to a permanent directory and `cd` into it (you should see `acp-mcp.exe` and `skills`). Copy `skills\acp-mcp` and `skills\gemini` into `$HOME\.claude\skills\` (back up and compare first if those directories already exist).
 
-Download build artifacts from a successful [Actions run](https://github.com/ummmme/acp-session-bridge/actions/workflows/release.yml). A push to `master` or a manual build produces artifacts without publishing a release. A matching version tag push publishes the [release](https://github.com/ummmme/acp-session-bridge/releases) after the build jobs pass. Check the archive's SHA-256 before installing; the macOS executable is unsigned and not notarized.
+Run `(Get-Command agy).Source` to find `agy`. Create `.acp-mcp.json` in your home directory using the JSON structure from step 2, replacing `\` with `/` in the path (for example, `C:/Tools/agy.exe`) to avoid JSON escaping issues. If the file already exists, merge only `local-agy`.
 
-## Reference
+Register and verify the server:
 
-- [MCP tools and input schemas](src/mcp/server.ts)
-- [Maintained agent definitions](src/agents/config.ts) and [registry profiles](src/agents/registry_profiles.ts)
-- [Upstream v0.2.6 reference](https://github.com/kxress/acp-mcp/blob/v0.2.6/README.md) — native installation, normalized model sizes and effort, ACP v2, and host-specific configuration
-- [Changelog](CHANGELOG.md) · [License: WTFPL v2](LICENSE)
+```powershell
+$bridge = (Resolve-Path '.\acp-mcp.exe').Path
+$config = (Join-Path $HOME '.acp-mcp.json')
+claude mcp add --scope user --transport stdio acp-session-bridge -- "$bridge" --config "$config"
+claude mcp get acp-session-bridge
+```
+
+Once it shows `Connected`, proceed to the verification step below.
+
+</details>
+
+## First-Run Verification
+
+Start a new Claude Code session in any project directory and send these two prompts in the **same conversation**:
+
+```text
+/gemini Remember the codename "Bamboo" for this discussion. Reply with "OK" only.
+/gemini Ask Gemini what codename I gave it in the previous turn. Don't include the codename in your question.
+```
+
+If prompted to choose a model on first use, pick one of the Gemini models listed by `agy`. Getting **"Bamboo"** back on the second turn confirms that both the bridge and session continuity are working.
+
+## Command Reference
+
+| Command | Behavior |
+| --- | --- |
+| `/gemini <prompt>` | Ask or follow up in the active project session; creates a session on first use |
+| `/gemini new <prompt>` | Start a fresh, independent session without prior context (labeled `A`, `B`, ...) |
+| `/gemini list` | List sessions in the current project and show which one is active |
+| `/gemini use <label>` | Switch to a session (e.g., `/gemini use A`); the next `/gemini` prompt continues it |
+| `/gemini close [label]` | Close an idle session (e.g., `/gemini close B`, or omit `[label]` to close the current idle session); active or pending-approval runs are kept |
+| `/gemini config set server <name>` | Point the Skill to an MCP server registered under a custom name |
+
+## Files & Paths
+
+| Path | Purpose |
+| --- | --- |
+| `<install-dir>/acp-mcp` (or `acp-mcp.mjs`) | MCP bridge server that manages ACP processes and multi-turn sessions |
+| `~/.claude/skills/gemini/` | Provides `/gemini` commands, project session tracking, and model preferences |
+| `~/.claude/skills/acp-mcp/` | Generic Skill for model discovery, task delegation, and permission handling |
+| `~/.acp-mcp.json` | Agent config defining launch commands and arguments for `local-agy` and other ACP agents |
+
+## Data & Permission Boundaries
+
+Prompts sent to Gemini, relevant context provided by Claude, and the contents of files Gemini reads may be sent to the model provider. Authorize only the materials needed for the task.
+
+- Explicitly scope the files or diff range before starting a review; avoid passing secrets or unrelated repositories.
+- `--sandbox` is simply a flag forwarded to `agy acp`. When source code must stay strictly read-only, enforce it at the OS level with a read-only workspace.
+
+## Troubleshooting
+
+**`/gemini` does nothing or is not recognized**: Confirm that `~/.claude/skills/gemini/SKILL.md` exists, then open a new Claude Code session and try `/gemini list`.
+
+**The server is missing or disconnected**: Run `claude mcp list` to find the name you registered. For example, if it is `gemini-agy`, run `claude mcp get gemini-agy`. If it shows `Connected`, use `/gemini config set server gemini-agy` inside Claude Code to select it. If the registered server is disconnected, check that the extracted directory still exists and that the registered command points to the installed executable or Node bundle.
+
+**Connected, but Gemini returns no reply**: Double-check the `command` path in `~/.acp-mcp.json` and confirm `agy` is logged in from your terminal. If a model is unavailable, check which Gemini models are enabled for your account.
+
+## Developers & Extensions
+
+The bridge executable is named `acp-mcp`. Any MCP-compatible client can connect to it to drive local ACP coding agents. Each server process hosts up to **20 sessions** by default:
+
+- One-shot tasks: `run_task`
+- Multi-turn tasks: `start_session` and `prompt`
+
+Build from source (requires Node.js **>= 24.12.0**):
+
+```sh
+npm ci
+npm run build
+```
+
+After building, Skills live under `.agents/skills/`. Register the MCP server using `node` and the absolute path to `dist/acp-mcp.mjs`.
+
+Docs & source pointers:
+- [Generic Skill](.agents/skills/acp-mcp/SKILL.md) · [Gemini Skill](.agents/skills/gemini/SKILL.md)
+- [MCP Tools & Schema](src/mcp/server.ts) · [Agent Config](src/agents/config.ts)
+- [Release Workflow](.github/workflows/release.yml) · [Changelog](CHANGELOG.md)
+
+## License
+
+Based on [kxress/acp-mcp](https://github.com/kxress/acp-mcp), released under [WTFPL v2](LICENSE).
