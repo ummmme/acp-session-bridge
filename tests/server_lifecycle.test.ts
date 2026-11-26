@@ -86,7 +86,13 @@ async function killFixture(pid: number) {
   }
 }
 
-test("stdio EOF gracefully closes active sessions and pending permissions", async () => {
+test("stdio EOF gracefully closes active sessions and pending permissions", () =>
+  checkStdioShutdown(false));
+
+test("stdio EOF cancels an approval arriving after cancellation has begun", () =>
+  checkStdioShutdown(true));
+
+async function checkStdioShutdown(latePermission: boolean) {
   const dir = await nodeFs.makeTempDir({ prefix: "acp-mcp-stdio-close-" });
   const configPath = `${dir}${
     process.platform === "win32" ? "\\" : "/"
@@ -113,6 +119,7 @@ test("stdio EOF gracefully closes active sessions and pending permissions", asyn
             "--exit-on-close",
             `--pid-file=${pidFile}`,
             `--close-marker=${closeMarker}`,
+            ...(latePermission ? ["--permission-after-cancel"] : []),
             `--permission-marker=${permissionMarker}`,
           ],
         },
@@ -173,8 +180,31 @@ test("stdio EOF gracefully closes active sessions and pending permissions", asyn
     });
     if (!prompting.result) throw new Error("Prompt did not start");
     await waitForFile(permissionMarker);
+    if (!latePermission) {
+      const deadline = Date.now() + 5000;
+      while (true) {
+        const reply = await request("tools/call", {
+          name: "get_session",
+          arguments: { sessionId: session.sessionId, includePromptText: false },
+        });
+        const snapshot = JSON.parse(
+          (reply.result as { content: Array<{ text: string }> }).content[0]
+            .text,
+        );
+        if (snapshot.pendingPermissions.length) break;
+        if (Date.now() >= deadline)
+          throw new Error("Approval never reached the bridge");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
     await writer.close();
     await waitForFile(closeMarker);
+    if (
+      latePermission &&
+      (await nodeFs.readText(`${permissionMarker}.outcome`)) !== "cancelled"
+    ) {
+      throw new Error("A late approval must receive the ACP cancelled outcome");
+    }
     const agentPid = Number(await nodeFs.readText(pidFile));
     let agentExitedBeforeDeadline = false;
     for (let i = 0; i < 55; i++) {
@@ -226,7 +256,7 @@ test("stdio EOF gracefully closes active sessions and pending permissions", asyn
     }
     await nodeFs.removePath(dir, { recursive: true });
   }
-});
+}
 
 test("hard server termination does not promise to kill ACP child processes", async () => {
   const dir = await nodeFs.makeTempDir({ prefix: "acp-mcp-hard-kill-" });

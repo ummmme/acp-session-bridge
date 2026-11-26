@@ -1259,7 +1259,9 @@ export class SessionManager {
       options.find((option) => option.kind === kind);
     if (
       session.acpSessionId !== params.sessionId ||
-      this.sessions.get(session.id) !== session
+      this.sessions.get(session.id) !== session ||
+      this.closingSessions.has(session.id) ||
+      session.prompt?.state === "cancelled"
     ) {
       return { outcome: { outcome: "cancelled" as const } };
     }

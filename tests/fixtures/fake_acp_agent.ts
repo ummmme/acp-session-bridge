@@ -333,6 +333,11 @@ app.onRequest("session/prompt", async ({ params, client }) => {
         "requested",
       );
     }
+    if (process.argv.includes("--permission-after-cancel")) {
+      while (!cancelled.has(sessionId)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
     const answer = await client.request("session/request_permission", {
       sessionId,
       toolCall: { toolCallId: "fake-call", kind: "execute" },
@@ -341,6 +346,15 @@ app.onRequest("session/prompt", async ({ params, client }) => {
         { optionId: "reject", name: "Reject once", kind: "reject_once" },
       ],
     });
+    if (
+      permissionMarker &&
+      process.argv.includes("--permission-after-cancel")
+    ) {
+      await nodeFs.writeText(
+        `${permissionMarker.slice("--permission-marker=".length)}.outcome`,
+        answer.outcome.outcome,
+      );
+    }
     await client.notify("session/update", {
       sessionId,
       update: {
