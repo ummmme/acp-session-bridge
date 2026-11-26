@@ -514,7 +514,14 @@ test("operator delegation returns a minimal handoff and expires its lease", asyn
     if (!manager.hasSession(sessionId)) {
       throw new Error("Prompt idle timeout overrode the permission lease");
     }
-    await new Promise((resolve) => setTimeout(resolve, 180));
+    // Expiry initiates shutdown; the slot stays occupied until the child exits.
+    const shutdownDeadline = performance.now() + 5000;
+    while (
+      manager.hasSession(sessionId) &&
+      performance.now() < shutdownDeadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     if (manager.hasSession(sessionId)) {
       throw new Error("Permission lease did not close the session");
     }
