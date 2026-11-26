@@ -2,7 +2,7 @@
 
 A local bridge that connects Claude Code to Gemini using your existing Antigravity CLI (`agy`) sign-in. Type `/gemini` to get a second opinion on a plan or code change, ask follow-up questions in the same session, or start a separate review without losing the first conversation.
 
-[Download v0.3.0](https://github.com/ummmme/acp-session-bridge/releases/tag/v0.3.0) · [中文 README](./README.zh.md)
+[Download v0.3.1](https://github.com/ummmme/acp-session-bridge/releases/tag/v0.3.1) · [中文 README](./README.zh.md)
 
 ```text
 /gemini Review the plan we just discussed: what's wrong with defining CTR as total clicks divided by sessions?
@@ -39,14 +39,14 @@ You should see `Usage: agy acp` and help output. If you haven't signed in with y
 
 ### 1. Download and extract to a permanent directory
 
-Download the matching archive from the **Assets** section of [v0.3.0 Releases](https://github.com/ummmme/acp-session-bridge/releases/tag/v0.3.0):
+Download the matching archive from the **Assets** section of [v0.3.1 Releases](https://github.com/ummmme/acp-session-bridge/releases/tag/v0.3.1):
 
 | Platform | Archive |
 | --- | --- |
-| Apple Silicon Mac (M-series) | `acp-mcp-0.3.0-macos-arm64.tar.gz` |
-| Intel Mac | `acp-mcp-0.3.0-node.zip` (requires Node.js >= 24.12.0) |
-| Linux x86_64 | `acp-mcp-0.3.0-linux-x86_64.tar.gz` |
-| Windows x86_64 | `acp-mcp-0.3.0-windows-x86_64.zip` |
+| Apple Silicon Mac (M-series) | `acp-mcp-0.3.1-macos-arm64.tar.gz` |
+| Intel Mac | `acp-mcp-0.3.1-node.zip` (requires Node.js >= 24.12.0) |
+| Linux x86_64 | `acp-mcp-0.3.1-linux-x86_64.tar.gz` |
+| Windows x86_64 | `acp-mcp-0.3.1-windows-x86_64.zip` |
 
 <details>
 <summary>Optional: Verify the SHA-256 checksum</summary>
@@ -55,12 +55,12 @@ Run this in your download directory with the archive and its matching `.sha256` 
 
 ```sh
 # macOS (for Intel Mac, substitute the Node ZIP .sha256 filename)
-shasum -a 256 -c acp-mcp-0.3.0-macos-arm64.tar.gz.sha256
+shasum -a 256 -c acp-mcp-0.3.1-macos-arm64.tar.gz.sha256
 ```
 
 ```sh
 # Linux
-sha256sum -c acp-mcp-0.3.0-linux-x86_64.tar.gz.sha256
+sha256sum -c acp-mcp-0.3.1-linux-x86_64.tar.gz.sha256
 ```
 
 Confirm the output ends with `OK`.
@@ -69,7 +69,7 @@ Confirm the output ends with `OK`.
 
 Extract the archive to a **permanent directory** and `cd` into it (you should see `skills/` inside). Claude Code launches the server from this path—moving or deleting the directory later will break the connection.
 
-The macOS native binary is not Apple-notarized; if macOS blocks it from running, use `acp-mcp-0.3.0-node.zip` instead.
+The macOS native binary is not Apple-notarized; if macOS blocks it from running, use `acp-mcp-0.3.1-node.zip` instead.
 
 ### 2. Install Skills and configure `agy`
 
@@ -135,7 +135,7 @@ Seeing **`Status: ✔ Connected`** confirms registration succeeded.
 Complete the Prerequisites check first. In PowerShell, `cd` into your download directory and optionally verify the checksum:
 
 ```powershell
-$archive = 'acp-mcp-0.3.0-windows-x86_64.zip'
+$archive = 'acp-mcp-0.3.1-windows-x86_64.zip'
 $expected = ((Get-Content "$archive.sha256" -Raw).Trim() -split '\s+')[0]
 if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) { throw 'SHA-256 verification failed' }
 ```

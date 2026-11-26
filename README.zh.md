@@ -2,7 +2,7 @@
 
 把 Claude Code 和 Gemini 连起来的本地桥接工具，复用本机已登录的 Antigravity CLI（`agy`）调用 Gemini。在 Claude Code 里输入 `/gemini`，就能让 Gemini 评审刚讨论的方案或代码，接着追问，或另开一个会话听取独立意见。
 
-[English README](./README.md) · [下载 v0.3.0](https://github.com/ummmme/acp-session-bridge/releases/tag/v0.3.0)
+[English README](./README.md) · [下载 v0.3.1](https://github.com/ummmme/acp-session-bridge/releases/tag/v0.3.1)
 
 ```text
 /gemini 看看刚才的方案：用总点击次数除以会话数作为点击率，有什么问题？
@@ -39,14 +39,14 @@ agy help acp
 
 ### 1. 下载并解压到固定目录
 
-在 [v0.3.0 Releases](https://github.com/ummmme/acp-session-bridge/releases/tag/v0.3.0) 的 **Assets** 中下载对应平台的压缩包：
+在 [v0.3.1 Releases](https://github.com/ummmme/acp-session-bridge/releases/tag/v0.3.1) 的 **Assets** 中下载对应平台的压缩包：
 
 | 平台 | 压缩包 |
 | --- | --- |
-| Apple 芯片 Mac（M 系列） | `acp-mcp-0.3.0-macos-arm64.tar.gz` |
-| Intel Mac | `acp-mcp-0.3.0-node.zip`（需 Node.js >= 24.12.0） |
-| Linux x86_64 | `acp-mcp-0.3.0-linux-x86_64.tar.gz` |
-| Windows x86_64 | `acp-mcp-0.3.0-windows-x86_64.zip` |
+| Apple 芯片 Mac（M 系列） | `acp-mcp-0.3.1-macos-arm64.tar.gz` |
+| Intel Mac | `acp-mcp-0.3.1-node.zip`（需 Node.js >= 24.12.0） |
+| Linux x86_64 | `acp-mcp-0.3.1-linux-x86_64.tar.gz` |
+| Windows x86_64 | `acp-mcp-0.3.1-windows-x86_64.zip` |
 
 <details>
 <summary>可选：核对 SHA-256 校验文件</summary>
@@ -55,12 +55,12 @@ agy help acp
 
 ```sh
 # macOS（Intel Mac 请替换为 Node ZIP 对应的 .sha256 文件名）
-shasum -a 256 -c acp-mcp-0.3.0-macos-arm64.tar.gz.sha256
+shasum -a 256 -c acp-mcp-0.3.1-macos-arm64.tar.gz.sha256
 ```
 
 ```sh
 # Linux
-sha256sum -c acp-mcp-0.3.0-linux-x86_64.tar.gz.sha256
+sha256sum -c acp-mcp-0.3.1-linux-x86_64.tar.gz.sha256
 ```
 
 输出 `OK` 即校验通过。
@@ -69,7 +69,7 @@ sha256sum -c acp-mcp-0.3.0-linux-x86_64.tar.gz.sha256
 
 将压缩包解压到一个**固定目录**，并在终端进入该目录（目录下应能看到 `skills/`）。Claude Code 会从这个路径启动服务，注册后移动或删除目录会导致连接失败。
 
-macOS 原生包未做 Apple 公证；如果系统阻止启动，改用 `acp-mcp-0.3.0-node.zip`。
+macOS 原生包未做 Apple 公证；如果系统阻止启动，改用 `acp-mcp-0.3.1-node.zip`。
 
 ### 2. 安装 Skill 并配置 `agy`
 
@@ -135,7 +135,7 @@ claude mcp get acp-session-bridge
 先完成「前置条件」检查。在 PowerShell 中进入下载目录，如需核对完整性：
 
 ```powershell
-$archive = 'acp-mcp-0.3.0-windows-x86_64.zip'
+$archive = 'acp-mcp-0.3.1-windows-x86_64.zip'
 $expected = ((Get-Content "$archive.sha256" -Raw).Trim() -split '\s+')[0]
 if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) { throw 'SHA-256 校验失败' }
 ```
