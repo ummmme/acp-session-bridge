@@ -49,12 +49,14 @@ async function harness(
   const manager = managerFor(agentId);
   const closedChildren: Promise<ProcessStatus>[] = [];
   const closedStderr: Array<() => string> = [];
-  const originalClose = manager.close.bind(manager);
-  manager.close = async (id) => {
-    const process = sessionInternalsForTest(manager, id).process;
+  // A crashed agent can exit and release its slot before the caller asks to close it.
+  const originalStart = manager.start.bind(manager);
+  manager.start = async (...args) => {
+    const session = await originalStart(...args);
+    const process = sessionInternalsForTest(manager, session.id).process;
     closedChildren.push(process.child.status);
     closedStderr.push(process.stderrTail);
-    await originalClose(id);
+    return session;
   };
   const server = createMcpServer(
     {

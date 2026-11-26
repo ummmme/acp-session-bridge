@@ -86,6 +86,18 @@ test("stopAgent kills uncooperative agent process trees, not just the direct chi
   }
 });
 
+test("stopping an exited child tolerates an already closed input stream", async () => {
+  const agent = await startAgent(
+    { command: process.execPath, args: ["-e", "process.stdin.resume()"] },
+    process.cwd(),
+  );
+  await agent.child.stdin.close();
+  await agent.child.status;
+  await stopAgent(agent.child);
+  await agent.stderrDone;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+});
+
 test("agents that ignore stdin EOF are force-killed within a bounded time", async () => {
   const fixture = new URL("./fixtures/ignore_shutdown.ts", import.meta.url)
     .pathname;

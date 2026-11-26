@@ -65,7 +65,13 @@ function requestClient(method: string, params: unknown): Promise<unknown> {
 }
 
 async function promptWork(sessionId: string, text: string) {
-  await update(sessionId, { sessionUpdate: "state_update", state: "running" });
+  if (text === "exit after ack") process.exit(17);
+  if (text !== "early error") {
+    await update(sessionId, {
+      sessionUpdate: "state_update",
+      state: "running",
+    });
+  }
   if (text === "delayed-completion") {
     await update(sessionId, {
       sessionUpdate: "agent_message_chunk",
@@ -117,7 +123,7 @@ async function promptWork(sessionId: string, text: string) {
       messageId: "answer",
       content: { type: "text", text: "activity kept the task alive" },
     });
-  } else if (text === "error") {
+  } else if (text === "error" || text === "early error") {
     await update(sessionId, {
       sessionUpdate: "state_update",
       state: "idle",

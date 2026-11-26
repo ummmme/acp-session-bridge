@@ -145,6 +145,55 @@ test("failed session tools return actionable sanitized diagnostics", async () =>
   });
 });
 
+test("managed failures use the profile selected when the session was launched", async () => {
+  const manager = new SessionManager({});
+  const server = createMcpServer({}, manager, {
+    resolveConfiguration: async () => ({
+      sources: [],
+      cwd: process.cwd(),
+      explicit: false,
+      agents: {
+        late: {
+          command: process.execPath,
+          args: [
+            fileURLToPath(
+              new URL("./fixtures/fake_acp_agent.ts", import.meta.url),
+            ),
+          ],
+          failureClassifier: "opencode",
+        },
+      },
+    }),
+  });
+  const mcp = await connectMcp(server);
+  const call = async (name: string, args: Record<string, unknown>) =>
+    parseToolResult(await mcp.callTool(name, args).response);
+  try {
+    const { sessionId } = await call("start_session", { agentId: "late" });
+    const turn = await call("prompt", {
+      sessionId,
+      text: "rate limit failure",
+    });
+    const session = await call("get_session", { sessionId });
+    const events = await call("get_events", { sessionId });
+    for (const prompt of [turn, session.prompt, events.prompt] as Array<
+      Record<string, unknown>
+    >) {
+      equal(prompt.state, "failed");
+      ok(String(prompt.error).includes("rate limit or quota"));
+      ok(
+        !JSON.stringify(prompt).includes(
+          "PRIVATE_PROVIDER_DIAGNOSTIC_SENTINEL",
+        ),
+      );
+    }
+  } finally {
+    await mcp.close();
+    await manager.closeAll();
+    await server.close();
+  }
+});
+
 test("initial start-session prompt failure returns sanitized diagnostics", async () => {
   await withMcpSession(async (mcp) => {
     const result = (await parseToolResult(

@@ -12,6 +12,7 @@ import type { ResolvedConfiguration } from "../config/discovery.ts";
 import {
   type AgentFailureClassifiers,
   classifyAgentFailure,
+  classifyProfileFailure,
 } from "../agents/failure_classifiers.ts";
 import { classifyOpenCodeFailure } from "../agents/opencode_failure_classifier.ts";
 import { findExecutablePath } from "../runtime/process.ts";
@@ -64,21 +65,26 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 function safePromptFailure(
   prompt: {
     state: string;
+    stopReason?: string;
     error?: string;
     errorCode?: number;
     errorData?: unknown;
   },
-  agentId: string,
-  agents: AgentMap,
+  session: { agentId: string; failureClassifier?: string },
   failureClassifiers: AgentFailureClassifiers,
 ): { error: string; errorCode?: number } | undefined {
   if (prompt.state !== "failed") return undefined;
-  const classification = classifyAgentFailure(
-    agents,
+  if (prompt.stopReason === "process_exited") {
+    return {
+      error:
+        "The ACP agent exited before completing this prompt. Its execution outcome is unknown.",
+    };
+  }
+  const classification = classifyProfileFailure(
+    session.failureClassifier,
     failureClassifiers,
-    agentId,
     {
-      agentId,
+      agentId: session.agentId,
       stage: "prompt",
       acpCode: prompt.errorCode,
       errorMessage: prompt.error,
@@ -139,6 +145,22 @@ function sanitizeV2FailureEvent(
         })()
       : raw;
   return { ...event, update, raw: sanitizedRaw };
+}
+
+function pendingApproval(
+  manager: SessionManager,
+  sessionId: string,
+  promptId: string,
+) {
+  const session = manager.getSessionSnapshot(sessionId);
+  if (session.prompt?.id !== promptId || !session.pendingPermissions.length)
+    return undefined;
+  return {
+    state: "running",
+    sessionId,
+    promptId,
+    pendingPermissions: session.pendingPermissions,
+  };
 }
 
 function runTaskFailure(
@@ -637,7 +659,8 @@ export function createMcpServer(
   server.registerTool(
     "start_session",
     {
-      description: "Start an ACP session and optionally send an initial prompt",
+      description:
+        "Start an ACP session and optionally send an initial prompt. A synchronous turn that needs operator input returns a running result with its prompt ID and pending permissions.",
       annotations: {
         title: "Start ACP session",
         readOnlyHint: false,
@@ -659,17 +682,20 @@ export function createMcpServer(
         prompt: z.string().optional(),
       },
     },
-    async ({
-      agentId: requestedAgentId,
-      cwd,
-      config,
-      model,
-      modelSize,
-      thinkingEffort,
-      modeId,
-      permissionPolicy,
-      prompt,
-    }) => {
+    async (
+      {
+        agentId: requestedAgentId,
+        cwd,
+        config,
+        model,
+        modelSize,
+        thinkingEffort,
+        modeId,
+        permissionPolicy,
+        prompt,
+      },
+      extra,
+    ) => {
       const agentId = canonicalAgentId(requestedAgentId);
       try {
         const resolved = await resolveOperationConfig(cwd);
@@ -698,11 +724,53 @@ export function createMcpServer(
           const promptRecord = prompt
             ? manager.beginPrompt(session.id, prompt)
             : undefined;
-          if (promptRecord) await promptRecord.done;
+          let handoff: ReturnType<typeof pendingApproval>;
+          while (promptRecord?.state === "running" && !handoff) {
+            await manager.waitPrompt(
+              session.id,
+              promptRecord.id,
+              Number.POSITIVE_INFINITY,
+              true,
+              extra.mcpReq.signal,
+            );
+            if (extra.mcpReq.signal.aborted) {
+              await manager.cancelPrompt(session.id, promptRecord.id);
+              await manager.close(session.id);
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify({ status: "cancelled" }),
+                  },
+                ],
+              };
+            }
+            if (promptRecord.state === "running")
+              handoff = pendingApproval(manager, session.id, promptRecord.id);
+          }
+          if (promptRecord && !handoff) await promptRecord.done;
+          if (handoff) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    sessionId: session.id,
+                    acpSessionId: session.acpSessionId,
+                    agentId,
+                    acpProtocol: session.acpProtocol,
+                    result: handoff,
+                  }),
+                },
+              ],
+            };
+          }
           const result = promptRecord
             ? promptRecord.state === "failed"
               ? promptRecord
               : {
+                  state: promptRecord.state,
+                  promptId: promptRecord.id,
                   stopReason: promptRecord.stopReason,
                   text: promptRecord.text,
                 }
@@ -715,8 +783,7 @@ export function createMcpServer(
                   stopReason: promptRecord.stopReason,
                   ...safePromptFailure(
                     promptRecord,
-                    agentId,
-                    resolved.agents,
+                    session,
                     failureClassifiers,
                   ),
                 }
@@ -1366,7 +1433,7 @@ export function createMcpServer(
     "prompt",
     {
       description:
-        "Send a prompt to an active ACP session; wait=false returns a prompt ID for polling",
+        "Send a prompt to an active ACP session; wait=false returns a prompt ID for polling. Synchronous waits return early with pending permissions when operator input is needed.",
       annotations: {
         title: "Prompt ACP session",
         readOnlyHint: false,
@@ -1381,14 +1448,38 @@ export function createMcpServer(
         waitMs: z.number().int().min(0).max(120000).optional(),
       },
     },
-    async ({ sessionId, text, wait = true, waitMs = 60000 }) => {
+    async ({ sessionId, text, wait = true, waitMs = 60000 }, extra) => {
       try {
         const prompt = manager.beginPrompt(sessionId, text);
-        if (wait) await manager.waitPrompt(sessionId, prompt.id, waitMs);
+        if (wait) {
+          await manager.waitPrompt(
+            sessionId,
+            prompt.id,
+            waitMs,
+            true,
+            extra.mcpReq.signal,
+          );
+          if (extra.mcpReq.signal.aborted) {
+            await manager.cancelPrompt(sessionId, prompt.id);
+            return {
+              content: [
+                { type: "text", text: JSON.stringify({ status: "cancelled" }) },
+              ],
+            };
+          }
+          const handoff =
+            prompt.state === "running"
+              ? pendingApproval(manager, sessionId, prompt.id)
+              : undefined;
+          if (handoff) {
+            return {
+              content: [{ type: "text", text: JSON.stringify(handoff) }],
+            };
+          }
+        }
         const failure = safePromptFailure(
           prompt,
-          manager.getSessionSnapshot(sessionId).agentId,
-          agents,
+          manager.getSessionSnapshot(sessionId),
           failureClassifiers,
         );
         return {
@@ -1417,7 +1508,7 @@ export function createMcpServer(
     "get_events",
     {
       description:
-        "Read buffered ACP session updates after a sequence cursor. Pass nextSequence as afterSequence to read the next page, even when hidden thoughts leave an empty page. An unchanged cursor means there are no newer buffered events. gap reports dropped events. includePromptText defaults to true; set it to false to omit accumulated prompt text.",
+        "Read buffered ACP session updates after a sequence cursor. Pass nextSequence as afterSequence to read the next page, even when hidden thoughts leave an empty page. An unchanged cursor means there are no newer buffered events. gap reports dropped events. waitMs returns on visible output, a gap, pending approval, turn completion, or timeout. includePromptText defaults to true; set it to false to omit accumulated prompt text.",
       annotations: {
         title: "Get ACP events",
         readOnlyHint: true,
@@ -1451,11 +1542,13 @@ export function createMcpServer(
       includePromptText = true,
     }) => {
       try {
-        if (
-          waitMs > 0 &&
-          manager.getEvents(sessionId, afterSequence, limit).events.length === 0
-        )
-          await new Promise((resolve) => setTimeout(resolve, waitMs));
+        if (waitMs > 0)
+          await manager.waitForVisibleEvent(
+            sessionId,
+            afterSequence,
+            waitMs,
+            includeThoughts,
+          );
         const result = manager.getEvents(sessionId, afterSequence, limit);
         const failureSnapshot =
           result.prompt?.state === "failed"
@@ -1466,8 +1559,7 @@ export function createMcpServer(
               failureSnapshot.prompt?.state === "failed"
                 ? failureSnapshot.prompt
                 : result.prompt!,
-              failureSnapshot.agentId,
-              agents,
+              failureSnapshot,
               failureClassifiers,
             )
           : undefined;
@@ -1587,7 +1679,7 @@ export function createMcpServer(
     "get_session",
     {
       description:
-        "Get capabilities and live configuration metadata. includePromptText defaults to true; set it to false to omit accumulated prompt text.",
+        "Get live session metadata or a retained read-only process exit snapshot. includePromptText defaults to true; set it to false to omit accumulated prompt text.",
       annotations: {
         title: "Get ACP session",
         readOnlyHint: true,
@@ -1617,6 +1709,7 @@ export function createMcpServer(
                 authMethods: s.authMethods,
                 configOptions: s.configOptions,
                 modes: s.modes,
+                processExit: s.processExit,
                 permissionPolicy: s.permissionPolicy,
                 pendingPermissions: s.pendingPermissions,
                 prompt: s.prompt
@@ -1625,12 +1718,9 @@ export function createMcpServer(
                       state: s.prompt.state,
                       ...(includePromptText ? { text: s.prompt.text } : {}),
                       stopReason: s.prompt.stopReason,
-                      ...(safePromptFailure(
-                        s.prompt,
-                        s.agentId,
-                        agents,
-                        failureClassifiers,
-                      ) ?? {}),
+                      textTruncated: s.prompt.textTruncated,
+                      ...(safePromptFailure(s.prompt, s, failureClassifiers) ??
+                        {}),
                     }
                   : undefined,
                 nextSequence: s.nextSequence - 1,

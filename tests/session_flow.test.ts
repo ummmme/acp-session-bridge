@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import process from "node:process";
 import * as nodeFs from "#fs";
-import { deepStrictEqual } from "node:assert/strict";
+import { deepStrictEqual, ok, rejects, throws } from "node:assert/strict";
 import {
   DEFAULT_MAX_MANAGED_SESSIONS,
   DEFAULT_SESSION_START_TIMEOUT_MS,
@@ -16,6 +16,16 @@ function fakeFixturePath() {
   return process.platform === "win32"
     ? decodeURIComponent(path.replace(/^\//, ""))
     : path;
+}
+
+async function waitForRetirement(manager: SessionManager, sessionId: string) {
+  const deadline = Date.now() + 5000;
+  while (manager.hasSession(sessionId) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  if (manager.hasSession(sessionId)) {
+    throw new Error(`Session did not exit: ${sessionId}`);
+  }
 }
 
 test("requested cwd is shared by the ACP session and child process", async () => {
@@ -519,5 +529,256 @@ test("advertises and uses ACP boolean configuration options", async () => {
     }
   } finally {
     await manager.closeAll();
+  }
+});
+
+test("agent process exit leaves safe diagnostics and rejects old handles", async () => {
+  const manager = new SessionManager({
+    fake: { command: process.execPath, args: [fakeFixturePath()] },
+  });
+  try {
+    const session = await manager.load(
+      "fake",
+      "recoverable-acp-session",
+      process.cwd(),
+    );
+    const prompt = manager.beginPrompt(session.id, "process crash");
+    await prompt.done;
+    await waitForRetirement(manager, session.id);
+
+    const snapshot = manager.getSessionSnapshot(session.id);
+    deepStrictEqual(snapshot.prompt?.state, "failed");
+    deepStrictEqual(snapshot.prompt?.stopReason, "process_exited");
+    deepStrictEqual(snapshot.processExit, { code: 17, signal: null });
+    const events = manager.getEvents(session.id).events;
+    const exited = events.find((event) => event.kind === "process_exited");
+    ok(exited);
+    deepStrictEqual(exited.update, { code: 17, signal: null });
+    deepStrictEqual(exited.raw, { code: 17, signal: null });
+    ok(!JSON.stringify(events).includes("PRIVATE_FAILURE_SENTINEL"));
+
+    for (const [id, message] of [
+      [session.id, `Session process has exited: ${session.id}`],
+      ["missing-session", "Unknown session: missing-session"],
+    ]) {
+      throws(() => manager.beginPrompt(id, "stale write"), { message });
+      await rejects(manager.setMode(id, "plan"), { message });
+      await rejects(manager.setConfigOption(id, "model", "test"), { message });
+      throws(() => manager.resolvePermission(id, "request", "reject"), {
+        message,
+      });
+    }
+    const resumed = await manager.load(
+      "fake",
+      session.acpSessionId,
+      process.cwd(),
+    );
+    await manager.close(resumed.id);
+  } finally {
+    await manager.closeAll();
+  }
+});
+
+for (const [task, expectedState, expectedReason] of [
+  ["process crash", "failed", "process_exited"],
+  ["large response then exit", "completed", "end_turn"],
+]) {
+  test(`B completes its original turn while A exits: ${task}`, async () => {
+    const manager = new SessionManager({
+      fake: { command: process.execPath, args: [fakeFixturePath()] },
+    });
+    try {
+      const a = await manager.start("fake", process.cwd());
+      const b = await manager.start(
+        "fake",
+        process.cwd(),
+        {},
+        undefined,
+        "operator",
+      );
+      // Keep B's real ACP request in flight until A's exit has been observed.
+      const bTurn = manager.beginPrompt(b.id, "permission");
+      await manager.waitPrompt(b.id, bTurn.id, 5000, true);
+      const [approval] = manager.getSessionSnapshot(b.id).pendingPermissions;
+      ok(approval);
+
+      const aTurn = manager.beginPrompt(a.id, task);
+      await waitForRetirement(manager, a.id);
+      const aResult = manager.getSessionSnapshot(a.id);
+      deepStrictEqual(aResult.processExit?.code, 17);
+      deepStrictEqual(
+        [aResult.prompt?.id, aResult.prompt?.state, aResult.prompt?.stopReason],
+        [aTurn.id, expectedState, expectedReason],
+      );
+      const bLive = manager.getSessionSnapshot(b.id);
+      deepStrictEqual(
+        [bLive.prompt?.id, bLive.prompt?.state],
+        [bTurn.id, "running"],
+      );
+      deepStrictEqual(bLive.pendingPermissions, [approval]);
+      manager.resolvePermission(b.id, approval.id, "reject");
+      const bResult = await manager.waitPrompt(b.id, bTurn.id, 5000);
+      deepStrictEqual(
+        [bResult.id, bResult.state, bResult.stopReason, bResult.text],
+        [bTurn.id, "completed", "end_turn", "reject"],
+      );
+    } finally {
+      await manager.closeAll();
+    }
+  });
+}
+
+test("tombstones bound aggregate bytes and mark a capped prompt answer", async () => {
+  const manager = new SessionManager(
+    { fake: { command: process.execPath, args: [fakeFixturePath()] } },
+    undefined,
+    undefined,
+    2,
+    10,
+    100 * 1024,
+  );
+  const retainedIds: string[] = [];
+  try {
+    for (let index = 0; index < 2; index++) {
+      const session = await manager.start("fake", process.cwd());
+      retainedIds.push(session.id);
+      const prompt = manager.beginPrompt(
+        session.id,
+        "large response then exit",
+      );
+      await prompt.done;
+      await waitForRetirement(manager, session.id);
+      const snapshot = manager.getSessionSnapshot(session.id);
+      deepStrictEqual(snapshot.prompt?.state, "completed");
+      deepStrictEqual(snapshot.prompt?.stopReason, "end_turn");
+      deepStrictEqual(snapshot.processExit, { code: 17, signal: null });
+      ok(snapshot.prompt?.textTruncated);
+      ok((snapshot.prompt?.text.length ?? Infinity) <= 64 * 1024);
+      deepStrictEqual(snapshot.prompt?.errorData, undefined);
+    }
+    let evicted = false;
+    try {
+      manager.getSessionSnapshot(retainedIds[0]);
+    } catch {
+      evicted = true;
+    }
+    ok(evicted, "the aggregate tombstone-byte limit should evict old records");
+    const newest = manager.getSessionSnapshot(retainedIds[1]);
+    deepStrictEqual(newest.prompt?.state, "completed");
+    ok(
+      manager
+        .getEvents(retainedIds[1])
+        .events.some((event) => event.kind === "process_exited"),
+    );
+  } finally {
+    await manager.closeAll();
+  }
+});
+
+test("tombstone count is bounded and concurrent close retains capacity until teardown", async () => {
+  const manager = new SessionManager(
+    {
+      fake: {
+        command: process.execPath,
+        args: [fakeFixturePath(), "--session-close-delay-ms=250"],
+      },
+    },
+    undefined,
+    1000,
+    1,
+    2,
+  );
+  try {
+    const exited: string[] = [];
+    for (let index = 0; index < 3; index++) {
+      const session = await manager.start("fake", process.cwd());
+      exited.push(session.id);
+      await manager.beginPrompt(session.id, "process crash").done;
+      await waitForRetirement(manager, session.id);
+    }
+    let countEvicted = false;
+    try {
+      manager.getEvents(exited[0]);
+    } catch {
+      countEvicted = true;
+    }
+    ok(countEvicted);
+    ok(
+      manager
+        .getEvents(exited[2])
+        .events.some((event) => event.kind === "process_exited"),
+    );
+
+    const session = await manager.start("fake", process.cwd());
+    const firstClose = manager.close(session.id);
+    const secondClose = manager.close(session.id);
+    deepStrictEqual(firstClose, secondClose);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    deepStrictEqual(manager.sessionCount, 1);
+    const atCapacity = await Promise.allSettled([
+      manager.start("fake", process.cwd()),
+    ]);
+    deepStrictEqual(atCapacity[0].status, "rejected");
+    await Promise.all([firstClose, secondClose]);
+    deepStrictEqual(manager.sessionCount, 0);
+    let closeRemovedHandle = false;
+    try {
+      manager.getSessionSnapshot(session.id);
+    } catch {
+      closeRemovedHandle = true;
+    }
+    ok(closeRemovedHandle, "explicit close must not retain a tombstone");
+  } finally {
+    await manager.closeAll();
+  }
+});
+
+test("MCP exposes exited sessions through get_session and get_events", async () => {
+  const agents = {
+    fake: { command: process.execPath, args: [fakeFixturePath()] },
+  };
+  const manager = new SessionManager(agents);
+  const server = createMcpServer(agents, manager);
+  const mcp = await connectMcp(server);
+  try {
+    const started = parseToolResult(
+      await mcp.callTool("start_session", {
+        agentId: "fake",
+        cwd: process.cwd(),
+      }).response,
+    ) as { sessionId: string };
+    await mcp.callTool("prompt", {
+      sessionId: started.sessionId,
+      text: "process crash",
+    }).response;
+    await waitForRetirement(manager, started.sessionId);
+
+    const session = parseToolResult(
+      await mcp.callTool("get_session", { sessionId: started.sessionId })
+        .response,
+    ) as {
+      prompt: { state: string; stopReason?: string };
+      processExit: { code: number; signal: string | null };
+    };
+    deepStrictEqual(session.processExit, { code: 17, signal: null });
+    deepStrictEqual(session.prompt.state, "failed");
+    deepStrictEqual(session.prompt.stopReason, "process_exited");
+
+    const journal = parseToolResult(
+      await mcp.callTool("get_events", { sessionId: started.sessionId })
+        .response,
+    ) as { events: Array<{ kind: string; update: unknown }> };
+    ok(
+      journal.events.some(
+        (event) =>
+          event.kind === "process_exited" &&
+          JSON.stringify(event.update) ===
+            JSON.stringify({ code: 17, signal: null }),
+      ),
+    );
+  } finally {
+    await mcp.close();
+    await manager.closeAll();
+    await server.close();
   }
 });

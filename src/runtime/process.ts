@@ -189,11 +189,8 @@ export async function stopAgent(
   child: SpawnedProcess,
   timeoutMs = 5000,
 ): Promise<void> {
-  try {
-    child.stdin.close();
-  } catch {
-    /* already closed */
-  }
+  // A closed or locked stream rejects; the process deadline still governs teardown.
+  void child.stdin.close().catch(() => undefined);
   const exitedWithin = async (ms: number) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const done = await Promise.race([

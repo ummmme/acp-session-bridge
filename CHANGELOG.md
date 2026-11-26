@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- Release a managed session's slot and resume lock when its agent process exits. Keep bounded, read-only exit records so clients can distinguish an interrupted prompt from an agent that exited after delivering its answer.
+- Return the session handle, prompt ID, running state, and pending permission requests when a synchronous prompt needs operator input. The client can resolve the request and continue polling the same turn.
+- Measure each journal event once when it is appended. Long polls wake on visible output, pending permissions, or prompt completion, while cursors still advance past hidden events.
+
 ## 0.3.0
 
 - Ship the `acp-mcp` and `gemini` Skills alongside the MCP server in the Node archive and each native package. The Claude Code Skill supports project-scoped follow-ups and explicit session selection.

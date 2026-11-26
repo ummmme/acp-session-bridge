@@ -3,6 +3,12 @@ import type { startAgent } from "../runtime/process.ts";
 
 export type AcpProtocol = "v1" | "v2";
 
+export class AcpDisconnectError extends Error {
+  constructor() {
+    super("The ACP connection closed before the turn completed.");
+  }
+}
+
 export interface NormalizedAcpUpdate {
   sessionId: string;
   kind: string;

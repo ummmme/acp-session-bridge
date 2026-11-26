@@ -29,7 +29,18 @@ export function classifyAgentFailure(
   agentId: string,
   context: FailureClassificationContext,
 ): FailureClassification | undefined {
-  const classifierId = agents[agentId]?.failureClassifier;
+  return classifyProfileFailure(
+    agents[agentId]?.failureClassifier,
+    classifiers,
+    context,
+  );
+}
+
+export function classifyProfileFailure(
+  classifierId: string | undefined,
+  classifiers: AgentFailureClassifiers,
+  context: FailureClassificationContext,
+): FailureClassification | undefined {
   if (!classifierId) return undefined;
   const classifier = classifiers[classifierId];
   if (!classifier) return undefined;

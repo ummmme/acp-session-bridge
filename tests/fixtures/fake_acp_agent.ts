@@ -215,6 +215,15 @@ app.onRequest("session/close", async () => {
   if (process.argv.slice(2).includes("--session-close-hang")) {
     await new Promise(() => {});
   }
+  const closeDelay = Number(
+    process.argv
+      .slice(2)
+      .find((arg) => arg.startsWith("--session-close-delay-ms="))
+      ?.slice("--session-close-delay-ms=".length),
+  );
+  if (Number.isFinite(closeDelay) && closeDelay > 0) {
+    await new Promise((resolve) => setTimeout(resolve, closeDelay));
+  }
   if (exitNonzeroAfterClose) {
     setTimeout(() => process.exit(23), 25);
   }
@@ -266,6 +275,17 @@ app.onRequest("session/prompt", async ({ params, client }) => {
   }
   if (promptText === "process crash") {
     process.exit(17);
+  }
+  if (promptText === "large response then exit") {
+    await client.notify("session/update", {
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "L".repeat(96 * 1024) },
+      },
+    });
+    setTimeout(() => process.exit(17), 100);
+    return { stopReason: "end_turn" };
   }
   if (promptText === "complete then exit nonzero on close") {
     exitNonzeroAfterClose = true;

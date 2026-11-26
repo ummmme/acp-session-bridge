@@ -58,14 +58,34 @@ async function handle(line: string) {
               {
                 sessionUpdate: "future_update",
                 detail:
-                  prompt === "oversized event"
-                    ? "x".repeat(4 * 1024 * 1024)
-                    : index,
+                  prompt === "oversized event" ? "界".repeat(900_000) : index,
               },
               { ordinal: index },
             ),
           );
         }
+      } else if (prompt === "long poll hidden") {
+        await write(
+          raw({
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: "hidden" },
+          }),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        await write(
+          raw({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "visible" },
+          }),
+        );
+      } else if (prompt === "hidden only") {
+        await write(
+          raw({
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: "hidden" },
+          }),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 120));
       } else if (prompt === "delegate isolation") {
         const large = "INTERNAL_THOUGHT_MARKER " + "x".repeat(12000);
         const updates = [

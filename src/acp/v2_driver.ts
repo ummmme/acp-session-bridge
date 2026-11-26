@@ -6,6 +6,7 @@ import {
 import type { AgentDefinition } from "../agents/config.ts";
 import type { startAgent } from "../runtime/process.ts";
 import { interceptV2SessionUpdates } from "./session_update_stream.ts";
+import { AcpDisconnectError } from "./protocol.ts";
 import { VERSION } from "../version.ts";
 import type {
   AcpPermissionRequest,
@@ -19,6 +20,7 @@ import type {
 type ActiveTurn = {
   running: boolean;
   finish: (stopReason?: string) => void;
+  fail: (error: unknown) => void;
 };
 
 export class V2Driver implements ProtocolDriver {
@@ -45,6 +47,15 @@ export class V2Driver implements ProtocolDriver {
       (params) => this.receiveUpdate(params, callbacks),
     );
     this.connection = this.app.connect(stream);
+    this.connection.signal.addEventListener(
+      "abort",
+      () => {
+        for (const turn of this.activeTurns.values())
+          turn.fail(new AcpDisconnectError());
+        this.activeTurns.clear();
+      },
+      { once: true },
+    );
   }
 
   private receiveUpdate(params: unknown, callbacks: ProtocolCallbacks): void {
@@ -54,7 +65,10 @@ export class V2Driver implements ProtocolDriver {
     if (!turn || normalized.kind !== "state_update") return;
     const state = (normalized.update as { state?: string }).state;
     if (state === "running") turn.running = true;
-    else if (state === "idle" && turn.running) {
+    else if (
+      state === "idle" &&
+      (turn.running || normalized.stopReason === "error")
+    ) {
       turn.finish(normalized.stopReason);
       this.activeTurns.delete(normalized.sessionId);
     }
@@ -134,21 +148,25 @@ export class V2Driver implements ProtocolDriver {
     if (this.activeTurns.has(sessionId)) {
       throw new Error("A v2 prompt turn is already active for this session");
     }
-    let finish!: (stopReason?: string) => void;
-    const stopped = new Promise<string | undefined>((resolve) => {
-      finish = resolve;
-    });
-    const turn: ActiveTurn = { running: false, finish };
+    const {
+      promise: stopped,
+      resolve,
+      reject,
+    } = Promise.withResolvers<string | undefined>();
+    const turn: ActiveTurn = { running: false, finish: resolve, fail: reject };
     this.activeTurns.set(sessionId, turn);
     try {
-      await this.connection.agent.request("session/prompt", {
-        sessionId,
-        prompt: [{ type: "text", text }],
-      });
-      return await stopped;
-    } catch (error) {
-      this.activeTurns.delete(sessionId);
-      throw error;
+      const [, reason] = await Promise.all([
+        this.connection.agent.request("session/prompt", {
+          sessionId,
+          prompt: [{ type: "text", text }],
+        }),
+        stopped,
+      ]);
+      return reason;
+    } finally {
+      if (this.activeTurns.get(sessionId) === turn)
+        this.activeTurns.delete(sessionId);
     }
   }
 
@@ -212,7 +230,10 @@ export class V2Driver implements ProtocolDriver {
   }
 
   closeConnection(error?: unknown): void {
-    for (const turn of this.activeTurns.values()) turn.finish("cancelled");
+    for (const turn of this.activeTurns.values()) {
+      if (error !== undefined) turn.fail(error);
+      else turn.finish("cancelled");
+    }
     this.activeTurns.clear();
     this.connection.close(error);
   }

@@ -37,6 +37,23 @@ function managerFor(
   });
 }
 
+for (const text of ["early error", "exit after ack"]) {
+  test(`ACP v2 settles a turn on ${text} without waiting for running/idle`, async () => {
+    const manager = managerFor();
+    try {
+      const session = await manager.start("fake", process.cwd());
+      const turn = manager.beginPrompt(session.id, text);
+      await manager.waitPrompt(session.id, turn.id, 3000);
+      if (turn.state !== "failed")
+        throw new Error(`Turn did not fail: ${turn.state}`);
+      if (text === "early error" && turn.errorCode !== -32042)
+        throw new Error("Missing early ACP error code");
+    } finally {
+      await manager.closeAll();
+    }
+  });
+}
+
 test("ACP v2 normalizes config, mode, streaming, snapshots, and unknown updates", async () => {
   const cwd = await nodeFs.makeTempDir({ prefix: "acp-mcp-v2-" });
   const manager = managerFor();

@@ -5,6 +5,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import type { AgentDefinition } from "../agents/config.ts";
 import type { startAgent } from "../runtime/process.ts";
+import { AcpDisconnectError } from "./protocol.ts";
 import { interceptSessionUpdates } from "./session_update_stream.ts";
 import type {
   AcpPermissionRequest,
@@ -100,11 +101,16 @@ export class V1Driver implements ProtocolDriver {
   }
 
   async prompt(sessionId: string, text: string): Promise<string | undefined> {
-    const response = await this.connection.agent.request("session/prompt", {
-      sessionId,
-      prompt: [{ type: "text", text }],
-    });
-    return response.stopReason;
+    try {
+      const response = await this.connection.agent.request("session/prompt", {
+        sessionId,
+        prompt: [{ type: "text", text }],
+      });
+      return response.stopReason;
+    } catch (error) {
+      if (this.connection.signal.aborted) throw new AcpDisconnectError();
+      throw error;
+    }
   }
 
   cancel(sessionId: string): Promise<void> {

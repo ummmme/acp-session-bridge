@@ -1,6 +1,7 @@
-import { deepStrictEqual as equal } from "node:assert/strict";
+import { deepStrictEqual as equal, ok } from "node:assert/strict";
 import { test } from "node:test";
 import process from "node:process";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { createMcpServer } from "../src/mcp/server.ts";
 import { SessionManager } from "../src/sessions/manager.ts";
@@ -14,7 +15,12 @@ type Page = {
 
 type Session = {
   prompt(text: string): Promise<unknown>;
-  events(cursor?: number, limit?: number, thoughts?: boolean): Promise<Page>;
+  events(
+    cursor?: number,
+    limit?: number,
+    thoughts?: boolean,
+    waitMs?: number,
+  ): Promise<Page>;
 };
 
 async function withSession(check: (session: Session) => Promise<void>) {
@@ -40,11 +46,17 @@ async function withSession(check: (session: Session) => Promise<void>) {
     });
     await check({
       prompt: (text) => call("prompt", { sessionId, text, wait: true }),
-      events: async (afterSequence = 0, limit = 100, includeThoughts = false) =>
+      events: async (
+        afterSequence = 0,
+        limit = 100,
+        includeThoughts = false,
+        waitMs = 0,
+      ) =>
         (await call("get_events", {
           sessionId,
           afterSequence,
           limit,
+          waitMs,
           includeThoughts,
         })) as Page,
     });
@@ -99,7 +111,49 @@ test("MCP pagination replays the journal across appends and hidden thought pages
   });
 });
 
-test("MCP pagination recovers from retained and completely dropped journal pages", async () => {
+async function pollWithEarlyWake(session: Session, promptText: string) {
+  const pending = session.events(0, 100, false, 15_000);
+  await session.prompt(promptText);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("Poll slept through the prompt")),
+          3000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test("MCP get_events long-polls past hidden events until visible output", async () => {
+  await withSession(async (session) => {
+    const start = performance.now();
+    const page = await pollWithEarlyWake(session, "long poll hidden");
+    equal(
+      page.events.map((event) => event.kind),
+      ["agent_message_chunk"],
+    );
+    ok(page.nextSequence >= 2);
+    ok(performance.now() - start >= 80);
+  });
+});
+
+test("MCP get_events advances hidden cursor when terminal prompt wakes the poll", async () => {
+  await withSession(async (session) => {
+    const start = performance.now();
+    const page = await pollWithEarlyWake(session, "hidden only");
+    equal(page.events, []);
+    equal(page.nextSequence, 1);
+    ok(performance.now() - start >= 80);
+  });
+});
+
+test("MCP pagination recovers retained events and UTF-8 byte-cap gaps", async () => {
   for (const prompt of ["event burst", "oversized event"]) {
     await withSession(async (session) => {
       await session.prompt(prompt);
