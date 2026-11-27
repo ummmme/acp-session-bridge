@@ -179,6 +179,8 @@ claude mcp get acp-session-bridge
 | `/gemini close [标签]` | 关闭空闲会话（如 `/gemini close B`，省略标签时关闭当前空闲会话）；如果正在回答或等待审批，任务会保留 |
 | `/gemini config set server <名称>` | 指向自定义名称注册的 MCP 服务 |
 
+**v0.4 开发版：** 用 `claude --resume` 回到原对话和项目，普通 `/gemini <问题>` 会接回上次选中的讨论。用 `/gemini rename B 测试方案` 命名，或用 `/gemini status` 查看书签和实时状态；查看状态不会启动助手。上一轮结果未知时，先核对工作区，再确认是否发送新问题。桥接器不会重发旧题。
+
 ## 文件与路径
 
 | 路径 | 作用 |

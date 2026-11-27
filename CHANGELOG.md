@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — 0.4.0
+
+- Restore the selected Gemini thread by Claude conversation and project, including its original working directory, model and reasoning setting. Sessions can be named and inspected without starting an agent.
+- Reserve ownership before starting an agent and journal each prompt before dispatch. Return completed replies even when saving their final status fails; require explicit acknowledgement before a new question after an unknown outcome.
+- Move session metadata into per-scope files managed by the bridge. Read matching legacy records without modifying the old index. Handle-only clients do not create bookmarks.
+
 ## 0.3.1
 
 - Release a managed session's slot and resume lock when its agent process exits. Keep bounded, read-only exit records so clients can distinguish an interrupted prompt from an agent that exited after delivering its answer.

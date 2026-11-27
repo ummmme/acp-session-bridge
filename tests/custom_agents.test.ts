@@ -100,8 +100,8 @@ test("trusted custom ACP agents use the generic MCP, policy, and session path", 
     const toolListing = (await mcp.listTools().response) as {
       result?: { tools?: unknown[] };
     };
-    if (toolListing.result?.tools?.length !== 16) {
-      throw new Error("Custom registration changed the 16-tool MCP surface");
+    if (toolListing.result?.tools?.length !== 17) {
+      throw new Error("Custom registration changed the 17-tool MCP surface");
     }
 
     const listed = parseToolResult(

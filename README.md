@@ -179,6 +179,8 @@ If prompted to choose a model on first use, pick one of the Gemini models listed
 | `/gemini close [label]` | Close an idle session (e.g., `/gemini close B`, or omit `[label]` to close the current idle session); active or pending-approval runs are kept |
 | `/gemini config set server <name>` | Point the Skill to an MCP server registered under a custom name |
 
+**v0.4 development build:** `claude --resume` followed by `/gemini <question>` restores the selected thread for that Claude conversation and project. `/gemini rename B QA-review` names a thread; `/gemini status` shows its saved or live state without waking the agent. If the previous answer was interrupted, check its effects before confirming a new question. The bridge never resends the old prompt.
+
 ## Files & Paths
 
 | Path | Purpose |

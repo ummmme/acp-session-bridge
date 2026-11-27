@@ -133,7 +133,11 @@ function installExitHooks() {
   process.on("exit", killLiveChildren);
 }
 
-export async function startAgent(definition: AgentDefinition, cwd: string) {
+export async function startAgent(
+  definition: AgentDefinition,
+  cwd: string,
+  leaseFd?: number,
+) {
   for (const name of definition.requiredExecutableEnv ?? []) {
     const value = getAgentEnvironmentValue(definition, name);
     if (!value?.trim() || !(await findExecutablePath(value.trim()))) {
@@ -167,6 +171,7 @@ export async function startAgent(definition: AgentDefinition, cwd: string) {
     stdin: "piped",
     stdout: "piped",
     stderr: "piped",
+    leaseFd,
   }).spawn();
   liveChildren.add(child);
   installExitHooks();

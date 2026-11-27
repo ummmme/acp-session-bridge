@@ -1,3 +1,4 @@
+import { recoverTurn, TurnConflict } from "../bookmarks/turn.ts";
 import process from "node:process";
 import * as nodeFs from "#fs";
 import { McpServer } from "@modelcontextprotocol/server";
@@ -16,7 +17,12 @@ import {
 } from "../agents/failure_classifiers.ts";
 import { classifyOpenCodeFailure } from "../agents/opencode_failure_classifier.ts";
 import { findExecutablePath } from "../runtime/process.ts";
-import { discoverAdvertisedModels } from "../models/discovery.ts";
+import {
+  advertisedOptionValues,
+  discoverAdvertisedModels,
+  isModelOption,
+} from "../models/discovery.ts";
+import { verifyLoadConfiguration } from "../models/resume_verification.ts";
 import {
   filterModels,
   isModelAllowed,
@@ -38,7 +44,12 @@ import {
 import { cleanupStaleWorkspaceSnapshots } from "../workspaces/stale_cleanup.ts";
 import { VERSION } from "../version.ts";
 
+import { ScopedBindings } from "./scoped_bindings.ts";
+import type { ScopeStore } from "../bookmarks/store.ts";
+import type { SessionReservation } from "../bookmarks/scoped_sessions.ts";
+
 type McpServerOptions = {
+  bookmarkStore?: ScopeStore;
   loadOpenCodeCatalog?: (signal: AbortSignal) => Promise<OpenCodeCatalog>;
   failureClassifiers?: AgentFailureClassifiers;
   workspaceCleanupRemove?: typeof nodeFs.removePath;
@@ -239,36 +250,12 @@ async function waitForModelCatalog(
   );
 }
 
-function isModelOption(
-  option: Record<string, unknown>,
-  agent: AgentDefinition,
-): boolean {
-  return (
-    option.type === "select" &&
-    (option.category === "model" ||
-      ((option.category === undefined || option.category === null) &&
-        option.id === agent.modelConfigId))
-  );
-}
-
 function configOptionIds(configOptions: Array<Record<string, unknown>>) {
   return new Set(
     configOptions.flatMap((option) =>
       typeof option.id === "string" ? [option.id] : [],
     ),
   );
-}
-
-function advertisedOptionValues(option: Record<string, unknown>): string[] {
-  if (!Array.isArray(option.options)) return [];
-  return option.options.flatMap((item) => {
-    if (!item || typeof item !== "object") return [];
-    const record = item as Record<string, unknown>;
-    if (Array.isArray(record.options) && typeof record.value !== "string") {
-      return advertisedOptionValues(record);
-    }
-    return typeof record.value === "string" ? [record.value] : [];
-  });
 }
 
 async function waitForThinkingChoice(
@@ -450,6 +437,7 @@ export function createMcpServer(
   options: McpServerOptions = {},
 ) {
   const server = new McpServer({ name: "acp-mcp", version: VERSION });
+  const scoped = new ScopedBindings(options.bookmarkStore);
   const loadOpenCodeCatalog =
     options.loadOpenCodeCatalog ?? ((signal) => fetchOpenCodeCatalog(signal));
   const failureClassifiers = {
@@ -670,6 +658,10 @@ export function createMcpServer(
       },
       inputSchema: {
         agentId: z.string(),
+        clientConversationId: z.string().optional(),
+        projectRoot: z.string().optional(),
+        sessionName: z.string().optional(),
+        thoughtConfigId: z.string().optional(),
         cwd: z.string().optional(),
         config: z.record(z.string(), z.string()).optional(),
         model: z.string().optional(),
@@ -685,6 +677,10 @@ export function createMcpServer(
     async (
       {
         agentId: requestedAgentId,
+        clientConversationId,
+        projectRoot,
+        sessionName,
+        thoughtConfigId,
         cwd,
         config,
         model,
@@ -697,32 +693,90 @@ export function createMcpServer(
       extra,
     ) => {
       const agentId = canonicalAgentId(requestedAgentId);
+      let reservation: SessionReservation | undefined;
       try {
+        if (
+          clientConversationId === undefined &&
+          (projectRoot !== undefined ||
+            sessionName !== undefined ||
+            thoughtConfigId !== undefined)
+        )
+          throw new Error("bookmark_scope_required");
+        const scope =
+          clientConversationId === undefined
+            ? undefined
+            : await scoped.sessions.scope(
+                clientConversationId,
+                cwd ?? process.cwd(),
+                projectRoot,
+              );
         const resolved = await resolveOperationConfig(cwd);
         const agent = resolved.agents[agentId];
         if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+        if (scope)
+          reservation = await scoped.sessions.reserveNew(
+            scope,
+            agentId,
+            sessionName,
+          );
         const session = await manager.start(
           agentId,
           cwd,
           {},
           modeId,
           permissionPolicy,
-          launchOptions(agent),
+          {
+            ...launchOptions(agent),
+            ...scoped.sessions.launchOptions(reservation, agent),
+          },
         );
         try {
-          await applyRequestSelection(
-            manager,
-            session.id,
-            agent,
-            {
+          if (
+            reservation &&
+            !modelSize &&
+            (model || config || thinkingEffort)
+          ) {
+            await verifyLoadConfiguration(
+              manager,
+              session.id,
+              agent,
               model,
-              modelSize,
               thinkingEffort,
-            },
-            config,
-          );
+              config,
+            );
+          } else {
+            await applyRequestSelection(
+              manager,
+              session.id,
+              agent,
+              {
+                model,
+                modelSize,
+                thinkingEffort,
+              },
+              config,
+            );
+          }
+          if (reservation && clientConversationId !== undefined) {
+            const thought =
+              thoughtConfigId ??
+              (thinkingEffort
+                ? agent.models?.thinkingEffort?.configOption
+                : undefined) ??
+              (config && Object.hasOwn(config, "thought_level")
+                ? "thought_level"
+                : undefined);
+            await scoped.activate(
+              manager,
+              clientConversationId,
+              reservation,
+              session,
+              agent,
+              thought,
+            );
+          }
           const promptRecord = prompt
-            ? manager.beginPrompt(session.id, prompt)
+            ? await manager.sendManagedPrompt(session.id, prompt)
             : undefined;
           let handoff: ReturnType<typeof pendingApproval>;
           while (promptRecord?.state === "running" && !handoff) {
@@ -797,7 +851,9 @@ export function createMcpServer(
                   acpSessionId: session.acpSessionId,
                   agentId,
                   acpProtocol: session.acpProtocol,
+                  label: reservation?.label,
                   result: safeResult,
+                  bookmarkPersistence: promptRecord?.bookmarkPersistence,
                 }),
               },
             ],
@@ -807,6 +863,8 @@ export function createMcpServer(
           throw e;
         }
       } catch (e) {
+        if (reservation)
+          await scoped.sessions.rollback(reservation).catch(() => {});
         return { isError: true, content: [{ type: "text", text: String(e) }] };
       }
     },
@@ -1349,8 +1407,14 @@ export function createMcpServer(
       },
       inputSchema: {
         agentId: z.string(),
-        acpSessionId: z.string(),
+        acpSessionId: z.string().optional(),
+        clientConversationId: z.string().optional(),
+        projectRoot: z.string().optional(),
+        target: z.string().optional(),
         cwd: z.string(),
+        model: z.string().optional(),
+        thinkingEffort: z.enum(THINKING_EFFORTS).optional(),
+        config: z.record(z.string(), z.string()).optional(),
         permissionPolicy: z
           .enum(["read_only", "operator", "allow_all", "deny_all"])
           .optional(),
@@ -1358,13 +1422,83 @@ export function createMcpServer(
     },
     async ({
       agentId: requestedAgentId,
+      clientConversationId,
+      projectRoot,
+      target,
       acpSessionId,
       cwd,
+      model,
+      thinkingEffort,
+      config,
       permissionPolicy,
     }) => {
       const agentId = canonicalAgentId(requestedAgentId);
       let managedSessionId: string | undefined;
+      let reservation: SessionReservation | undefined;
       try {
+        if (clientConversationId !== undefined) {
+          if (
+            model !== undefined ||
+            thinkingEffort !== undefined ||
+            config !== undefined
+          )
+            throw new Error("scoped_load_uses_saved_configuration");
+          const scope = await scoped.sessions.scope(
+            clientConversationId,
+            cwd,
+            projectRoot,
+          );
+          const { label, entry, current } = await scoped.sessions.lookup(
+            scope,
+            target,
+          );
+          if (
+            entry.agentId !== agentId ||
+            (acpSessionId !== undefined && acpSessionId !== entry.acpSessionId)
+          )
+            throw new Error("session_identity_mismatch");
+          const reused = await scoped.reuse(
+            manager,
+            scope,
+            label,
+            entry,
+            current,
+            async () =>
+              (await resolveOperationConfig(entry.sessionCwd)).agents[agentId],
+          );
+          if (reused)
+            return {
+              content: [{ type: "text", text: JSON.stringify(reused) }],
+            };
+          reservation = await scoped.sessions.reserveLoad(
+            scope,
+            agentId,
+            label,
+            acpSessionId,
+          );
+          const originalScope = await scoped.sessions.scope(
+            clientConversationId,
+            reservation.entry.sessionCwd,
+            scope.projectRoot,
+          );
+          if (
+            originalScope.scopeKey !== scope.scopeKey ||
+            originalScope.sessionCwd !== reservation.entry.sessionCwd
+          )
+            throw new Error("session_identity_mismatch");
+          cwd = reservation.entry.sessionCwd;
+          acpSessionId = reservation.entry.acpSessionId ?? undefined;
+          model = reservation.entry.model ?? undefined;
+          if (reservation.entry.thoughtConfig)
+            config = {
+              [reservation.entry.thoughtConfig.configId]:
+                reservation.entry.thoughtConfig.value,
+            };
+        } else if (target !== undefined || projectRoot !== undefined) {
+          throw new Error("bookmark_scope_required");
+        }
+        if (!acpSessionId)
+          throw new Error("acpSessionId is required for an unscoped load");
         const resolved = await resolveOperationConfig(cwd);
         const agent = resolved.agents[agentId];
         if (!agent) throw new Error(`Unknown agent: ${agentId}`);
@@ -1373,10 +1507,27 @@ export function createMcpServer(
           acpSessionId,
           cwd,
           permissionPolicy,
-          launchOptions(agent),
+          {
+            ...launchOptions(agent),
+            ...scoped.sessions.launchOptions(reservation, agent),
+          },
         );
         managedSessionId = session.id;
         let configOptions = session.configOptions;
+        if (
+          model !== undefined ||
+          thinkingEffort !== undefined ||
+          Object.keys(config ?? {}).length > 0
+        ) {
+          configOptions = await verifyLoadConfiguration(
+            manager,
+            session.id,
+            agent,
+            model,
+            thinkingEffort,
+            config,
+          );
+        }
         let models = discoverAdvertisedModels(configOptions, agent);
         if (
           !models.some((model) => model.selected) &&
@@ -1402,6 +1553,19 @@ export function createMcpServer(
               : "Cannot verify resumed model against current model policy because ACP did not identify it",
           );
         }
+        manager.recordModelSelection(
+          session.id,
+          current ? { model: current.id } : undefined,
+        );
+        if (reservation && clientConversationId !== undefined)
+          await scoped.activate(
+            manager,
+            clientConversationId,
+            reservation,
+            session,
+            agent,
+            reservation.entry.thoughtConfig?.configId,
+          );
         return {
           content: [
             {
@@ -1413,6 +1577,11 @@ export function createMcpServer(
                 acpProtocol: session.acpProtocol,
                 configOptions,
                 modes: session.modes,
+                label: reservation?.label,
+                name: reservation?.entry.name,
+                lastPrompt: reservation
+                  ? recoverTurn(reservation.entry.lastPrompt)
+                  : undefined,
               }),
             },
           ],
@@ -1425,6 +1594,8 @@ export function createMcpServer(
             /* startup or policy validation already closed it */
           }
         }
+        if (reservation)
+          await scoped.sessions.rollback(reservation).catch(() => {});
         return { isError: true, content: [{ type: "text", text: String(e) }] };
       }
     },
@@ -1444,13 +1615,51 @@ export function createMcpServer(
       inputSchema: {
         sessionId: z.string(),
         text: z.string(),
+        acknowledgeUnknownOutcomeForPromptId: z.string().optional(),
+        clientConversationId: z.string().optional(),
         wait: z.boolean().optional(),
         waitMs: z.number().int().min(0).max(120000).optional(),
       },
     },
-    async ({ sessionId, text, wait = true, waitMs = 60000 }, extra) => {
+    async (
+      {
+        sessionId,
+        text,
+        wait = true,
+        waitMs = 60000,
+        acknowledgeUnknownOutcomeForPromptId,
+        clientConversationId,
+      },
+      extra,
+    ) => {
       try {
-        const prompt = manager.beginPrompt(sessionId, text);
+        scoped.checkHandle(sessionId, clientConversationId);
+        if (
+          clientConversationId !== undefined &&
+          acknowledgeUnknownOutcomeForPromptId === undefined
+        ) {
+          const live = manager.getSessionSnapshot(sessionId);
+          if (live.promptActive && live.prompt?.state === "running")
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    promptId: live.prompt.id,
+                    state: "running",
+                    reused: true,
+                    sent: false,
+                    pendingPermissions: live.pendingPermissions,
+                  }),
+                },
+              ],
+            };
+        }
+        const prompt = await manager.sendManagedPrompt(
+          sessionId,
+          text,
+          acknowledgeUnknownOutcomeForPromptId,
+        );
         if (wait) {
           await manager.waitPrompt(
             sessionId,
@@ -1477,6 +1686,7 @@ export function createMcpServer(
             };
           }
         }
+        if (prompt.state !== "running") await prompt.done;
         const failure = safePromptFailure(
           prompt,
           manager.getSessionSnapshot(sessionId),
@@ -1491,6 +1701,7 @@ export function createMcpServer(
                 state: prompt.state,
                 text: prompt.text,
                 stopReason: prompt.stopReason,
+                bookmarkPersistence: prompt.bookmarkPersistence,
                 error: failure?.error ?? prompt.error,
                 ...(failure?.errorCode === undefined
                   ? {}
@@ -1500,6 +1711,19 @@ export function createMcpServer(
           ],
         };
       } catch (e) {
+        if (e instanceof TurnConflict && e.promptId)
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  errorCode: e.code,
+                  promptId: e.promptId,
+                }),
+              },
+            ],
+          };
         return { isError: true, content: [{ type: "text", text: String(e) }] };
       }
     },
@@ -1517,7 +1741,11 @@ export function createMcpServer(
         openWorldHint: false,
       },
       inputSchema: {
-        sessionId: z.string(),
+        sessionId: z.string().optional(),
+        clientConversationId: z.string().optional(),
+        cwd: z.string().optional(),
+        projectRoot: z.string().optional(),
+        target: z.string().optional(),
         afterSequence: z.number().int().min(0).optional(),
         limit: z
           .number()
@@ -1534,6 +1762,10 @@ export function createMcpServer(
     },
     async ({
       sessionId,
+      clientConversationId,
+      cwd,
+      projectRoot,
+      target,
       afterSequence = 0,
       limit = 100,
       waitMs = 0,
@@ -1542,6 +1774,40 @@ export function createMcpServer(
       includePromptText = true,
     }) => {
       try {
+        const observed =
+          clientConversationId === undefined
+            ? undefined
+            : await scoped.observe(
+                manager,
+                clientConversationId,
+                cwd ?? process.cwd(),
+                projectRoot,
+                target,
+                sessionId,
+              );
+        if (
+          !observed &&
+          (target !== undefined ||
+            projectRoot !== undefined ||
+            cwd !== undefined)
+        )
+          throw new Error("bookmark_scope_required");
+        if (observed && !observed.snapshot)
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  ...observed,
+                  events: [],
+                  nextSequence: observed.afterSequence,
+                  gap: false,
+                }),
+              },
+            ],
+          };
+        sessionId = observed?.snapshot?.id ?? sessionId;
+        if (!sessionId) throw new Error("sessionId required");
         if (waitMs > 0)
           await manager.waitForVisibleEvent(
             sessionId,
@@ -1590,7 +1856,12 @@ export function createMcpServer(
           content: [
             {
               type: "text",
-              text: JSON.stringify({ ...result, events, prompt }),
+              text: JSON.stringify({
+                ...result,
+                events,
+                prompt,
+                source: observed?.source,
+              }),
             },
           ],
         };
@@ -1643,37 +1914,63 @@ export function createMcpServer(
         idempotentHint: true,
         openWorldHint: false,
       },
-      inputSchema: z.object({}),
+      inputSchema: {
+        clientConversationId: z.string().optional(),
+        cwd: z.string().optional(),
+        projectRoot: z.string().optional(),
+      },
     },
-    (): Promise<CallToolResult> =>
-      Promise.resolve({
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              manager
-                .listSessionSnapshots()
-                .map(
-                  ({
-                    id,
-                    agentId,
-                    cwd,
-                    acpSessionId,
-                    acpProtocol,
-                    promptActive,
-                  }) => ({
-                    id,
-                    agentId,
-                    cwd,
-                    acpSessionId,
-                    acpProtocol,
-                    promptActive,
-                  }),
-                ),
-            ),
-          },
-        ],
-      }),
+    async ({
+      clientConversationId,
+      cwd,
+      projectRoot,
+    }): Promise<CallToolResult> => {
+      try {
+        let rows: unknown[];
+        if (clientConversationId === undefined) {
+          if (projectRoot !== undefined)
+            throw new Error("bookmark_scope_required");
+          rows = manager
+            .listSessionSnapshots()
+            .map(
+              ({
+                id,
+                agentId,
+                cwd,
+                acpSessionId,
+                acpProtocol,
+                promptActive,
+              }) => ({
+                id,
+                agentId,
+                cwd,
+                acpSessionId,
+                acpProtocol,
+                promptActive,
+              }),
+            );
+        } else {
+          const scope = await scoped.sessions.scope(
+            clientConversationId,
+            cwd ?? process.cwd(),
+            projectRoot,
+          );
+          const book = await scoped.sessions.store.read(scope.scopeKey);
+          rows = Object.entries(book?.sessions ?? {}).map(([label, e]) => {
+            const snapshot = scoped.localSnapshot(manager, e);
+            return {
+              label,
+              current: label === book?.currentLabel,
+              id: snapshot?.id,
+              ...scoped.describe(manager, e, snapshot),
+            };
+          });
+        }
+        return { content: [{ type: "text", text: JSON.stringify(rows) }] };
+      } catch (e) {
+        return { isError: true, content: [{ type: "text", text: String(e) }] };
+      }
+    },
   );
   server.registerTool(
     "get_session",
@@ -1688,19 +1985,66 @@ export function createMcpServer(
         openWorldHint: false,
       },
       inputSchema: {
-        sessionId: z.string(),
+        sessionId: z.string().optional(),
+        clientConversationId: z.string().optional(),
+        cwd: z.string().optional(),
+        projectRoot: z.string().optional(),
+        target: z.string().optional(),
         includePromptText: z.boolean().optional(),
       },
     },
-    ({ sessionId, includePromptText = true }) => {
+    async ({
+      sessionId,
+      includePromptText = true,
+      clientConversationId,
+      cwd,
+      projectRoot,
+      target,
+    }) => {
       try {
-        const s = manager.getSessionSnapshot(sessionId);
+        const observed =
+          clientConversationId === undefined
+            ? undefined
+            : await scoped.observe(
+                manager,
+                clientConversationId,
+                cwd ?? process.cwd(),
+                projectRoot,
+                target,
+                sessionId,
+                true,
+              );
+        if (
+          !observed &&
+          (target !== undefined ||
+            projectRoot !== undefined ||
+            cwd !== undefined)
+        )
+          throw new Error("bookmark_scope_required");
+        if (observed && !observed.snapshot)
+          return {
+            content: [{ type: "text", text: JSON.stringify(observed) }],
+          };
+        if (!observed?.snapshot && !sessionId)
+          throw new Error("sessionId required");
+        const s =
+          observed?.snapshot ?? (await manager.settledSnapshot(sessionId!));
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify({
                 id: s.id,
+                source: observed?.source,
+                status: observed?.status,
+                bookmarkPersistence: observed?.bookmarkPersistence,
+                label: observed?.label,
+                name: observed?.name,
+                current: observed?.current,
+                model: observed?.model,
+                thoughtConfig: observed?.thoughtConfig,
+                lastPrompt: observed?.lastPrompt,
+                promptActive: s.promptActive,
                 agentId: s.agentId,
                 cwd: s.cwd,
                 acpSessionId: s.acpSessionId,
@@ -1719,6 +2063,7 @@ export function createMcpServer(
                       ...(includePromptText ? { text: s.prompt.text } : {}),
                       stopReason: s.prompt.stopReason,
                       textTruncated: s.prompt.textTruncated,
+                      bookmarkPersistence: s.prompt.bookmarkPersistence,
                       ...(safePromptFailure(s.prompt, s, failureClassifiers) ??
                         {}),
                     }
@@ -1766,16 +2111,18 @@ export function createMcpServer(
             throw new Error(`Model '${value}' is denied by model policy`);
           }
         }
+        const configOptions = await manager.setConfigOption(
+          sessionId,
+          configId,
+          value,
+        );
+        await scoped.configurationChanged(manager, sessionId, configId);
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify({
-                configOptions: await manager.setConfigOption(
-                  sessionId,
-                  configId,
-                  value,
-                ),
+                configOptions,
               }),
             },
           ],
@@ -1851,6 +2198,40 @@ export function createMcpServer(
     },
   );
   server.registerTool(
+    "rename_session",
+    {
+      description:
+        "Rename a bookmarked session without switching or loading it",
+      annotations: {
+        title: "Rename ACP session",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      inputSchema: {
+        clientConversationId: z.string(),
+        cwd: z.string(),
+        projectRoot: z.string().optional(),
+        target: z.string().optional(),
+        name: z.string(),
+      },
+    },
+    async ({ clientConversationId, cwd, projectRoot, target, name }) => {
+      try {
+        const scope = await scoped.sessions.scope(
+          clientConversationId,
+          cwd,
+          projectRoot,
+        );
+        const result = await scoped.sessions.rename(scope, target, name);
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      } catch (e) {
+        return { isError: true, content: [{ type: "text", text: String(e) }] };
+      }
+    },
+  );
+  server.registerTool(
     "close_session",
     {
       description: "Close an ACP session",
@@ -1862,7 +2243,11 @@ export function createMcpServer(
         openWorldHint: true,
       },
       inputSchema: {
-        sessionId: z.string(),
+        sessionId: z.string().optional(),
+        clientConversationId: z.string().optional(),
+        cwd: z.string().optional(),
+        projectRoot: z.string().optional(),
+        target: z.string().optional(),
         ifIdle: z
           .boolean()
           .optional()
@@ -1871,8 +2256,51 @@ export function createMcpServer(
           ),
       },
     },
-    async ({ sessionId, ifIdle = false }) => {
+    async ({
+      sessionId,
+      ifIdle = false,
+      clientConversationId,
+      cwd,
+      projectRoot,
+      target,
+    }) => {
       try {
+        if (clientConversationId !== undefined) {
+          const scope = await scoped.sessions.scope(
+            clientConversationId,
+            cwd ?? process.cwd(),
+            projectRoot,
+          );
+          const { label, entry } = await scoped.sessions.lookup(
+            scope,
+            target,
+            sessionId,
+          );
+          if (sessionId && entry.sessionId !== sessionId)
+            throw new Error("session_identity_mismatch");
+          if (entry.status === "offline" || entry.status === "closed") {
+            const closed = await scoped.sessions.closeOffline(scope, label);
+            return {
+              content: [{ type: "text", text: JSON.stringify(closed) }],
+            };
+          }
+          if (!entry.sessionId || !scoped.sessions.isOwnedHere(entry))
+            throw new Error("session_occupied");
+          sessionId = entry.sessionId;
+          scoped.checkHandle(sessionId, clientConversationId);
+          ifIdle = true;
+        } else if (
+          target !== undefined ||
+          cwd !== undefined ||
+          projectRoot !== undefined
+        )
+          throw new Error("bookmark_scope_required");
+        if (!sessionId) throw new Error("sessionId required");
+        const live = manager.getSessionSnapshot(sessionId);
+        const explicit =
+          !ifIdle || (!live.promptActive && !live.pendingPermissions.length)
+            ? scoped.markExplicit(sessionId)
+            : undefined;
         let closed = true;
         if (ifIdle) closed = await manager.closeIfIdle(sessionId);
         else await manager.close(sessionId);
@@ -1882,7 +2310,18 @@ export function createMcpServer(
               type: "text",
               text: JSON.stringify(
                 closed
-                  ? { closed, sessionId }
+                  ? {
+                      closed,
+                      sessionId,
+                      ...(explicit?.saveError
+                        ? {
+                            bookmarkPersistence: {
+                              saved: false,
+                              errorCode: explicit.saveError,
+                            },
+                          }
+                        : {}),
+                    }
                   : { closed, sessionId, reason: "busy" },
               ),
             },

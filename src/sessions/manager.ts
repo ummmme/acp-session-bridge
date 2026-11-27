@@ -1,16 +1,6 @@
+import { RequestError } from "@agentclientprotocol/sdk";
 import process from "node:process";
 import { realpath } from "#fs";
-import {
-  canonicalAgentId,
-  type AgentDefinition,
-  type AgentMap,
-} from "../agents/config.ts";
-import type {
-  AgentModelPolicy,
-  ModelSize,
-  ThinkingEffort,
-} from "../models/policy.ts";
-import { AcpDisconnectError } from "../acp/protocol.ts";
 import { createProtocolDriver } from "../acp/driver_factory.ts";
 import type {
   AcpPermissionRequest,
@@ -18,6 +8,29 @@ import type {
   NormalizedAcpUpdate,
   ProtocolDriver,
 } from "../acp/protocol.ts";
+import { AcpDisconnectError } from "../acp/protocol.ts";
+import {
+  type AgentDefinition,
+  type AgentMap,
+  canonicalAgentId,
+} from "../agents/config.ts";
+import type { ScopeStore } from "../bookmarks/store.ts";
+import {
+  TurnConflict,
+  type TurnBookmark,
+  type TurnState,
+} from "../bookmarks/turn.ts";
+import {
+  type BookmarkPersistence,
+  recordTurnState,
+  reserveAndDispatch,
+  type TurnBinding,
+} from "../bookmarks/turn_journal.ts";
+import type {
+  AgentModelPolicy,
+  ModelSize,
+  ThinkingEffort,
+} from "../models/policy.ts";
 import { startAgent, stopAgent } from "../runtime/process.ts";
 
 interface ManagedSession {
@@ -31,11 +44,19 @@ interface ManagedSession {
   driver: ProtocolDriver;
   process: Awaited<ReturnType<typeof startAgent>>;
   promptActive: boolean;
+  reserving?: boolean;
   capabilities: unknown;
   authMethods: unknown;
   configOptions: Array<Record<string, unknown>>;
   modes: Record<string, unknown> | undefined;
   prompt?: PromptRecord;
+  journal?: {
+    store: ScopeStore;
+    binding: TurnBinding;
+    onRetired?: (lastTurn?: TurnBookmark) => Promise<void>;
+    beforeDispatch?: () => void;
+  };
+  retirementTask?: Promise<void>;
   events: SessionEvent[];
   eventSizes: number[];
   eventBytes: number;
@@ -82,6 +103,11 @@ interface PromptRecord {
   errorCode?: number;
   errorData?: unknown;
   connectionClosed?: boolean;
+  confirmedProtocolError?: boolean;
+  cancelRequested?: boolean;
+  terminal?: TurnState;
+  bookmarkPersistence?: BookmarkPersistence;
+  journal?: { store: ScopeStore; binding: TurnBinding };
   done: Promise<void>;
 }
 
@@ -90,6 +116,14 @@ export type PermissionPolicy =
   | "operator"
   | "allow_all"
   | "deny_all";
+
+function settledTurn(prompt: PromptRecord) {
+  if (prompt.terminal && prompt.journal)
+    return {
+      state: prompt.terminal,
+      owner: { ...prompt.journal.binding.owner },
+    };
+}
 
 export interface SessionSnapshot {
   readonly id: string;
@@ -122,10 +156,12 @@ export interface SessionSnapshot {
     state: PromptRecord["state"];
     text: string;
     textTruncated?: boolean;
+    settledTurn?: { state: TurnState; owner: TurnBinding["owner"] };
     stopReason?: string;
     error?: string;
     errorCode?: number;
     errorData?: unknown;
+    bookmarkPersistence?: BookmarkPersistence;
   };
   readonly nextSequence: number;
   readonly processExit?: { code: number; signal: NodeJS.Signals | null };
@@ -139,6 +175,7 @@ export interface PromptHandle {
   readonly error?: string;
   readonly errorCode?: number;
   readonly errorData?: unknown;
+  readonly bookmarkPersistence?: BookmarkPersistence;
   readonly lastActivityAt: number;
   readonly activityVersion: number;
   readonly done: Promise<void>;
@@ -146,6 +183,8 @@ export interface PromptHandle {
 
 export interface SessionLaunchOptions {
   agentDefinition?: AgentDefinition;
+  leaseFd?: number;
+  beforeInitialize?: (pid: number | undefined) => Promise<void>;
 }
 
 type PendingPermissionSnapshot = SessionSnapshot["pendingPermissions"][number];
@@ -242,6 +281,18 @@ export class SessionManager {
     return this.sessions.has(id);
   }
 
+  teardownTask(id: string): Promise<void> | undefined {
+    return (
+      this.closingSessions.get(id) ?? this.sessions.get(id)?.retirementTask
+    );
+  }
+
+  reusableSnapshot(id: string): SessionSnapshot | undefined {
+    const session = this.sessions.get(id);
+    if (session && !session.processExit && !this.teardownTask(id))
+      return this.sessionSnapshot(session);
+  }
+
   listSessionSnapshots(): SessionSnapshot[] {
     return [...this.sessions.values()].map((session) =>
       this.sessionSnapshot(session),
@@ -256,6 +307,11 @@ export class SessionManager {
     return structuredClone(tombstone.snapshot);
   }
 
+  async settledSnapshot(id: string) {
+    const prompt = this.sessions.get(id)?.prompt;
+    if (prompt?.journal && prompt.state !== "running") await prompt.done;
+    return this.getSessionSnapshot(id);
+  }
   recordModelSelection(
     sessionId: string,
     selection:
@@ -270,6 +326,117 @@ export class SessionManager {
     session.modelSelection = selection ? { ...selection } : undefined;
   }
 
+  /** Bind only after the caller has acquired the execution lease. */
+  bindSessionJournal(
+    sessionId: string,
+    store: ScopeStore,
+    binding: TurnBinding,
+    onRetired?: (lastTurn?: TurnBookmark) => Promise<void>,
+    beforeDispatch?: () => void,
+  ): void {
+    const session = this.requireSession(sessionId);
+    if (binding.sessionId !== sessionId)
+      throw new Error("Turn binding does not match the managed session");
+    if (session.promptActive)
+      throw new Error("Cannot bind a journal while a prompt is active");
+    if (session.journal) {
+      if (
+        session.journal.store !== store ||
+        session.journal.onRetired !== onRetired ||
+        JSON.stringify(session.journal.binding) !== JSON.stringify(binding)
+      )
+        throw new Error("A different turn journal is already bound");
+      return;
+    }
+    session.journal = {
+      store,
+      binding: structuredClone(binding),
+      onRetired,
+      beforeDispatch,
+    };
+  }
+
+  /** Persist reservation before dispatch; this path never retries or replays. */
+  async sendManagedPrompt(
+    sessionId: string,
+    text: string,
+    acknowledgeUnknownOutcomeForPromptId?: string,
+  ): Promise<PromptHandle> {
+    const session = this.requireSession(sessionId);
+    if (!session.journal) {
+      if (acknowledgeUnknownOutcomeForPromptId !== undefined)
+        throw new Error("Cannot acknowledge an unbound session journal");
+      return this.beginPrompt(sessionId, text);
+    }
+    if (session.promptActive || session.reserving)
+      throw new Error("A prompt is already active for this session");
+    session.reserving = true;
+    try {
+      const previous = session.prompt;
+      if (previous) {
+        await previous.done;
+        if (
+          previous.bookmarkPersistence?.saved === false &&
+          previous.terminal
+        ) {
+          previous.bookmarkPersistence = await this.persistBoundPromptState(
+            previous,
+            previous.terminal,
+          );
+          if (!previous.bookmarkPersistence.saved)
+            throw new Error(previous.bookmarkPersistence.errorCode);
+        }
+      }
+      const { store, binding, beforeDispatch } = session.journal;
+      beforeDispatch?.();
+      return await reserveAndDispatch(
+        store,
+        binding,
+        async (promptId) => {
+          try {
+            this.requireSession(sessionId);
+            beforeDispatch?.();
+          } catch (error) {
+            await recordTurnState(store, binding, promptId, "not_sent");
+            throw error;
+          }
+          return this.beginPromptRecord(session, text, promptId, {
+            store,
+            binding,
+          });
+        },
+        acknowledgeUnknownOutcomeForPromptId,
+      );
+    } catch (error) {
+      if (error instanceof TurnConflict && error.code === "stale_owner") {
+        session.driver.closeConnection();
+        await stopAgent(session.process.child);
+      }
+      throw error;
+    } finally {
+      session.reserving = false;
+    }
+  }
+
+  private async persistBoundPromptState(
+    prompt: PromptRecord,
+    state: TurnState,
+  ): Promise<BookmarkPersistence> {
+    if (!prompt.journal) return { saved: false, errorCode: "stale_owner" };
+    try {
+      return await recordTurnState(
+        prompt.journal.store,
+        prompt.journal.binding,
+        prompt.id,
+        state,
+        (this.sessions.get(prompt.journal.binding.sessionId)?.nextSequence ??
+          1) - 1,
+      );
+    } catch {
+      return { saved: false, errorCode: "bookmark_io" };
+    }
+  }
+
   getPromptHandle(sessionId: string, promptId: string): PromptHandle {
     return this.promptHandle(this.requirePrompt(sessionId, promptId));
   }
@@ -282,7 +449,7 @@ export class SessionManager {
       cwd: session.cwd,
       acpSessionId: session.acpSessionId,
       acpProtocol: session.acpProtocol,
-      promptActive: session.promptActive,
+      promptActive: session.promptActive || !!session.reserving,
       capabilities: structuredClone(session.capabilities),
       authMethods: structuredClone(session.authMethods),
       configOptions: structuredClone(session.configOptions),
@@ -307,11 +474,15 @@ export class SessionManager {
         ? {
             id: session.prompt.id,
             state: session.prompt.state,
+            settledTurn: settledTurn(session.prompt),
             text: session.prompt.text,
             stopReason: session.prompt.stopReason,
             error: session.prompt.error,
             errorCode: session.prompt.errorCode,
             errorData: structuredClone(session.prompt.errorData),
+            bookmarkPersistence: session.prompt.bookmarkPersistence
+              ? { ...session.prompt.bookmarkPersistence }
+              : undefined,
           }
         : undefined,
       nextSequence: session.nextSequence,
@@ -341,6 +512,11 @@ export class SessionManager {
       },
       get errorData() {
         return structuredClone(prompt.errorData);
+      },
+      get bookmarkPersistence() {
+        return prompt.bookmarkPersistence
+          ? { ...prompt.bookmarkPersistence }
+          : undefined;
       },
       get lastActivityAt() {
         return prompt.lastActivityAt;
@@ -507,7 +683,7 @@ export class SessionManager {
       ...def,
       env: { ...def.protocolEnv?.[protocol], ...def.env },
     };
-    const process = await startAgent(launchDefinition, cwd);
+    const process = await startAgent(launchDefinition, cwd, options.leaseFd);
     const earlyUpdates: NormalizedAcpUpdate[] = [];
     let reservedAcpKey = loadKey;
     let managedSession: ManagedSession | undefined;
@@ -550,6 +726,7 @@ export class SessionManager {
     });
     let startupTimer: ReturnType<typeof setTimeout> | undefined;
     try {
+      await options.beforeInitialize?.(process.child.pid);
       const startup = async () => {
         const initialized = await driver.initialize();
         if (launchFailed) {
@@ -750,12 +927,23 @@ export class SessionManager {
 
   beginPrompt(sessionId: string, text: string): PromptHandle {
     const session = this.requireSession(sessionId);
+    if (session.journal)
+      throw new Error("Bound sessions must use sendManagedPrompt");
+    return this.beginPromptRecord(session, text, crypto.randomUUID());
+  }
+
+  private beginPromptRecord(
+    session: ManagedSession,
+    text: string,
+    promptId: string,
+    journal?: { store: ScopeStore; binding: TurnBinding },
+  ): PromptHandle {
     if (session.promptActive) {
       throw new Error("A prompt is already active for this session");
     }
     session.promptActive = true;
     const record: PromptRecord = {
-      id: crypto.randomUUID(),
+      id: promptId,
       state: "running",
       text: "",
       messageText: new Map(),
@@ -763,6 +951,7 @@ export class SessionManager {
       lastActivityAt: performance.now(),
       activityVersion: 0,
       activityWaiters: new Set(),
+      journal,
       done: Promise.resolve(),
     };
     session.prompt = record;
@@ -824,11 +1013,12 @@ export class SessionManager {
     record: PromptRecord,
     text: string,
   ): Promise<void> {
+    let runningWrite: Promise<BookmarkPersistence> | undefined;
     try {
-      const stopReason = await session.driver.prompt(
-        session.acpSessionId,
-        text,
-      );
+      const reply = session.driver.prompt(session.acpSessionId, text);
+      if (record.journal)
+        runningWrite = this.persistBoundPromptState(record, "running");
+      const stopReason = await reply;
       if (record.state === "running") {
         record.stopReason = stopReason;
         record.state = stopReason === "cancelled" ? "cancelled" : "completed";
@@ -842,6 +1032,8 @@ export class SessionManager {
         if (exit) this.handleProcessExit(session, exit.code, exit.signal);
       }
       if (record.state === "running") {
+        record.confirmedProtocolError ||=
+          session.acpProtocol === "v1" && error instanceof RequestError;
         record.state = "failed";
         record.error = error instanceof Error ? error.message : String(error);
         if (
@@ -861,6 +1053,22 @@ export class SessionManager {
       this.cancelPendingPermissions(session);
       this.wakePromptActivityWaiters(session);
       this.notifyEventWaiters(session.id);
+      if (record.journal) {
+        const terminal: TurnState =
+          record.state === "completed"
+            ? "completed"
+            : record.state === "cancelled"
+              ? "cancelled"
+              : record.confirmedProtocolError
+                ? "failed_confirmed"
+                : "outcome_unknown";
+        record.terminal = terminal;
+        await runningWrite;
+        record.bookmarkPersistence = await this.persistBoundPromptState(
+          record,
+          terminal,
+        );
+      }
     }
   }
 
@@ -927,7 +1135,17 @@ export class SessionManager {
     const session = this.requireSession(sessionId);
     const prompt = this.requirePrompt(sessionId, promptId);
     if (prompt.state === "running") {
-      prompt.state = "cancelled";
+      if (prompt.journal) {
+        prompt.cancelRequested = true;
+        prompt.bookmarkPersistence = await this.persistBoundPromptState(
+          prompt,
+          "cancel_requested",
+        );
+      } else {
+        prompt.state = "cancelled";
+      }
+      if (prompt.journal && prompt.state !== "running")
+        return this.promptHandle(prompt);
       for (const waiter of [...prompt.activityWaiters]) waiter();
       this.notifyEventWaiters(sessionId);
       this.cancelPendingPermissions(session);
@@ -1129,6 +1347,7 @@ export class SessionManager {
         session.prompt.state = "cancelled";
       } else if (updateEvent.error) {
         session.prompt.state = "failed";
+        session.prompt.confirmedProtocolError = true;
         session.prompt.error =
           updateEvent.error?.message ?? "ACP prompt failed";
         session.prompt.errorCode = updateEvent.error?.code;
@@ -1261,6 +1480,7 @@ export class SessionManager {
       session.acpSessionId !== params.sessionId ||
       this.sessions.get(session.id) !== session ||
       this.closingSessions.has(session.id) ||
+      session.prompt?.cancelRequested ||
       session.prompt?.state === "cancelled"
     ) {
       return { outcome: { outcome: "cancelled" as const } };
@@ -1409,7 +1629,7 @@ export class SessionManager {
     if (this.closingSessions.has(session.id)) {
       this.notifyEventWaiters(session.id);
     } else {
-      this.retireSession(session);
+      void this.retireSession(session);
     }
   }
 
@@ -1436,9 +1656,13 @@ export class SessionManager {
       prompt: last && {
         id: last.id,
         state: last.state,
+        settledTurn: settledTurn(last),
         stopReason: last.stopReason,
         text: last.text.slice(0, MAX_TOMBSTONE_PROMPT_TEXT_CHARS),
         errorCode: last.errorCode,
+        bookmarkPersistence: last.bookmarkPersistence
+          ? { ...last.bookmarkPersistence }
+          : undefined,
         ...(last.text.length > MAX_TOMBSTONE_PROMPT_TEXT_CHARS
           ? { textTruncated: true }
           : {}),
@@ -1486,19 +1710,59 @@ export class SessionManager {
     }
   }
 
-  private retireSession(session: ManagedSession): void {
-    if (!session.retired) {
-      session.retired = true;
-      if (this.sessions.get(session.id) === session) {
-        this.sessions.delete(session.id);
-        this.occupiedSlots = Math.max(0, this.occupiedSlots - 1);
+  private retireSession(session: ManagedSession): Promise<void> {
+    if (!session.journal) {
+      if (!session.retired) {
+        session.retired = true;
+        if (this.sessions.get(session.id) === session) {
+          this.sessions.delete(session.id);
+          this.occupiedSlots = Math.max(0, this.occupiedSlots - 1);
+        }
+      }
+      this.storeTombstone(session);
+      if (this.acpSessionOwners.get(session.acpSessionKey) === session) {
+        this.acpSessionOwners.delete(session.acpSessionKey);
+      }
+      this.notifyEventWaiters(session.id);
+      return Promise.resolve();
+    }
+    if (session.retirementTask) return session.retirementTask;
+    session.retirementTask = (async () => {
+      if (session.prompt) await session.prompt.done;
+      await this.runRetirementCallback(session);
+      if (!session.retired) {
+        session.retired = true;
+        if (this.sessions.get(session.id) === session) {
+          this.sessions.delete(session.id);
+          this.occupiedSlots = Math.max(0, this.occupiedSlots - 1);
+        }
+      }
+      this.storeTombstone(session);
+      if (this.acpSessionOwners.get(session.acpSessionKey) === session) {
+        this.acpSessionOwners.delete(session.acpSessionKey);
+      }
+      this.notifyEventWaiters(session.id);
+    })();
+    return session.retirementTask;
+  }
+
+  private async runRetirementCallback(session: ManagedSession): Promise<void> {
+    try {
+      const prompt = session.prompt;
+      await session.journal?.onRetired?.(
+        prompt?.terminal
+          ? { promptId: prompt.id, state: prompt.terminal }
+          : undefined,
+      );
+    } catch {
+      const prompt = session.prompt;
+      if (prompt) {
+        prompt.bookmarkPersistence = {
+          saved: false,
+          errorCode: "retirement_callback_failed",
+        };
       }
     }
-    this.storeTombstone(session);
-    if (this.acpSessionOwners.get(session.acpSessionKey) === session) {
-      this.acpSessionOwners.delete(session.acpSessionKey);
-    }
-    this.notifyEventWaiters(session.id);
   }
 
   async closeIfIdle(id: string): Promise<boolean> {
@@ -1508,6 +1772,7 @@ export class SessionManager {
     }
     const session = this.requireSession(id);
     if (
+      session.reserving ||
       session.promptActive ||
       session.prompt?.state === "running" ||
       session.pendingPermissions.size > 0
@@ -1521,6 +1786,7 @@ export class SessionManager {
     const activeClose = this.closingSessions.get(id);
     if (activeClose) return activeClose;
     const session = this.sessions.get(id);
+    if (session?.retirementTask) return session.retirementTask;
     if (!session) {
       const record = this.tombstones.get(id);
       if (record) {
@@ -1580,6 +1846,8 @@ export class SessionManager {
       }
       session.driver.closeConnection();
       await stopAgent(session.process.child, 5000);
+      if (session.prompt?.journal) await session.prompt.done;
+      await this.runRetirementCallback(session);
     } finally {
       if (this.sessions.get(session.id) === session) {
         this.sessions.delete(session.id);

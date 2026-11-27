@@ -90,6 +90,12 @@ const expectedAnnotations: Record<
     idempotentHint: false,
     openWorldHint: true,
   },
+  rename_session: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
   close_session: {
     readOnlyHint: false,
     destructiveHint: true,

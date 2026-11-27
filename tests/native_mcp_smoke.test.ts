@@ -154,8 +154,8 @@ test(
         const listing = await read();
         const tools = (listing.result as { tools?: unknown[] } | undefined)
           ?.tools;
-        if (listing.id !== 2 || tools?.length !== 16) {
-          throw new Error("Native MCP tools/list did not return 16 tools");
+        if (listing.id !== 2 || tools?.length !== 17) {
+          throw new Error("Native MCP tools/list did not return 17 tools");
         }
         await writer.close();
         const status = await Promise.race([

@@ -31,11 +31,7 @@ export function discoverAdvertisedModels(
   const seen = new Set<string>();
   for (const option of configOptions) {
     const configId = typeof option.id === "string" ? option.id : undefined;
-    const isModelOption =
-      option.category === "model" ||
-      ((option.category === undefined || option.category === null) &&
-        configId === agent.modelConfigId);
-    if (!configId || option.type !== "select" || !isModelOption) continue;
+    if (!configId || !isModelOption(option, agent)) continue;
     const currentValue =
       typeof option.currentValue === "string" ? option.currentValue : undefined;
     for (const choice of choices(option.options)) {
@@ -54,4 +50,22 @@ export function discoverAdvertisedModels(
     }
   }
   return result;
+}
+
+export function isModelOption(
+  option: Record<string, unknown>,
+  agent: AgentDefinition,
+): boolean {
+  return (
+    option.type === "select" &&
+    (option.category === "model" ||
+      ((option.category === undefined || option.category === null) &&
+        option.id === agent.modelConfigId))
+  );
+}
+
+export function advertisedOptionValues(
+  option: Record<string, unknown>,
+): string[] {
+  return choices(option.options).map((entry) => entry.value as string);
 }

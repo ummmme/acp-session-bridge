@@ -20,6 +20,8 @@ The bridge permits up to 20 managed sessions per server process by default, incl
 
 Use live session IDs returned by the service. Keep the bridge `sessionId` separate from any downstream ACP session ID. If a bridge restart removed a handle, use `list_sessions` before loading a downstream session again. Resume only when the agent advertises support and the required downstream ID is known; verify the resumed agent, working directory, and effective model/configuration before continuing. A failed resume does not authorize replaying a prompt that may still be running.
 
+Clients opting into durable sessions pass their stable conversation ID and project directory to the scoped tools; the service owns bookmark writes. Use scoped `list_sessions` or `get_session` for read-only status, `load_session` to select or restore, and `rename_session` to name a thread. A saved unknown outcome requires explicit acknowledgement for the specific old prompt ID before a new question. Handle-only clients continue without bookmarks.
+
 For cleanup, call `close_session` with `ifIdle: true` when available. A response such as `{ "closed": false, "reason": "busy" }` means a prompt is running or an approval is pending; leave it intact and tell the user. Do not retry without `ifIdle`, cancel work, or close another session to free a slot unless the user explicitly authorizes that action. If the connected service does not advertise `ifIdle`, avoid destructive close for a session that may be active; report the capability gap.
 
 ## Asynchronous prompts and lightweight polling

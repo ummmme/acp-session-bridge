@@ -21,6 +21,7 @@ export type ProcessCommandOptions = {
   stdout?: "inherit" | "null" | "piped";
   stderr?: "inherit" | "null" | "piped";
   shell?: boolean;
+  leaseFd?: number;
 };
 
 function stdio(value: "inherit" | "null" | "piped" | undefined) {
@@ -101,6 +102,7 @@ export class ProcessCommand {
         stdio(this.options.stdin),
         stdio(this.options.stdout),
         stdio(this.options.stderr),
+        ...(this.options.leaseFd === undefined ? [] : [this.options.leaseFd]),
       ],
       windowsHide: true,
       shell: this.options.shell ?? false,
