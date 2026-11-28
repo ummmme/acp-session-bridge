@@ -26,6 +26,8 @@ async function runP1(scopeKey: string): Promise<void> {
     process.execPath,
     [fileURLToPath(import.meta.url), "child"],
     {
+      // Exercise an independently living child even when the OS reaps ordinary children.
+      detached: true,
       stdio: ["ignore", "pipe", "inherit", lease.childStdio],
       windowsHide: true,
     },

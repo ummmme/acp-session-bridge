@@ -102,7 +102,11 @@ app.onRequest("session/new", async () => {
 
 app.onRequest("session/load", async ({ params }) => {
   const sessionId = (params as { sessionId: string }).sessionId;
-  if (audit) await appendFile(audit, `load ${sessionId} ${process.cwd()}\n`);
+  if (audit)
+    await appendFile(
+      audit,
+      `load ${sessionId} ${process.cwd()} pid=${process.pid}\n`,
+    );
   const value = (await readState())[sessionId];
   if (!value) throw new Error(`Unknown fixture session: ${sessionId}`);
   active.set(sessionId, value);

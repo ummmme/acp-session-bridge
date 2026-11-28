@@ -7,6 +7,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      windows_sessions_only:
+        description: Run only the Windows session-lifetime regressions
+        type: boolean
+        default: false
 
 concurrency:
   group: release-${{ github.ref }}
@@ -16,7 +21,20 @@ permissions:
   contents: read
 
 jobs:
+  windows-sessions:
+    name: Windows session lifetime
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_sessions_only
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 26
+      - run: npm ci
+      - run: node --test tests/execution_lease.test.ts tests/scoped_stdio.test.ts
+
   node-package:
+    if: github.event_name != 'workflow_dispatch' || !inputs.windows_sessions_only
     name: Build Node package
     runs-on: ubuntu-latest
     steps:
@@ -47,6 +65,7 @@ jobs:
           compression-level: 0
 
   native:
+    if: github.event_name != 'workflow_dispatch' || !inputs.windows_sessions_only
     name: Build ${{ matrix.target }}
     strategy:
       fail-fast: false
